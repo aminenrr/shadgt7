@@ -106,6 +106,8 @@ ryty_add_library(ryty_gpu libSceVideoOut
         src/imgui/renderer/texture_manager.cpp
         # FIX-GT7-100: the compile notice shown while the game shows no new frame.
         src/imgui/compile_notice_layer.cpp
+        # FEAT-GT7-186: the trophy pop-up; libSceNpAuth.prx calls its RytyTrophyToast export.
+        src/imgui/trophy_toast_layer.cpp
         src/sdl_window.cpp
         ${INPUT}
         src/core/debug_state.cpp
