@@ -133,8 +133,14 @@ public:
         /// DLSS-GT7-001: the frame's depth, motion vectors and jitter, when the game's temporal
         /// anti-aliasing pass was seen in it (RYGT_DLSS_TEMPORAL=1).
         std::optional<RytyUpscale::TemporalInputs> temporal;
+        /// GPU.hd_ui: the proxy to show instead of `view` (scene scaled, UI drawn at the output
+        /// size), at `output_size`; null without one.
+        vk::ImageView output_view{};
+        vk::Extent2D output_size{};
     };
-    std::optional<Display> FindDisplay(const VideoCore::ImageInfo& info, vk::Format view_format);
+    /// `window` is the size the presenter's frame has (GPU.hd_ui sizes its proxy from it).
+    std::optional<Display> FindDisplay(const VideoCore::ImageInfo& info, vk::Format view_format,
+                                       vk::Extent2D window);
 
     /// NAT-116: saves the render targets noted while the rasterizer collected a frame.
     void DumpFrame(const std::filesystem::path& dir);
@@ -182,8 +188,15 @@ private:
     struct Targets {
         RenderState state{};
         std::array<const Native::ImageEntry*, 8> colors{};
+        std::array<vk::Format, 8> color_formats{}; ///< GPU.hd_ui: the formats the views have
         std::array<DrawnRange, 8> color_ranges{}; ///< FIX-208
         const Native::ImageEntry* depth = nullptr;
+        u32 ui_color_feedback = 0;   ///< GPU.hd_ui: the colors the draw also samples or stores
+        u32 ui_auxiliary_mask = 0;   ///< GPU.hd_ui: the extra colors that draw into proxies
+        bool ui_side_effects = false;
+        bool ui_depth_feedback = false;
+        bool ui_depth_proxy = false; ///< GPU.hd_ui: the draw's depth is a proxy
+        bool ui_depth_write = false;
     };
 
     /// The bindings of one draw or dispatch.
@@ -824,6 +837,17 @@ private:
                                                           bool mirror = false);
 
     bool ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline, Targets& out);
+    /// GPU.hd_ui (vk_ui_hires.h): a draw into a display buffer after the scene composite goes to
+    /// the buffer's output-size proxy; draws and copies that read the buffer get the proxy's
+    /// picture first.
+    void PrepareUiTarget(Targets& targets, const GraphicsPipeline& pipeline,
+                         const AmdGpu::Regs& regs);
+    void FinishUiTargets(const Targets& targets);
+    void PrepareMapIcons(const Targets& targets, const GraphicsPipeline& pipeline,
+                         const AmdGpu::Regs& regs, DrawBindings& b);
+    void ResolveUiDisplay(VAddr address, bool keep);
+    void SyncUiReads(std::span<const Shader::Info* const> stages);
+    void SyncUiRange(VAddr address, u64 size, bool keep);
     /// DIAG-GT7-001: GPU timestamps of the main stream's lists.
     static bool GpuTimeOn();
     void GpuTimeBegin(Stream& s);
@@ -1407,6 +1431,8 @@ private:
     DrawBindings bindings;
     u64 frame = 0;
     u64 timing_tick = 0; ///< OPT-001
+    u64 ui_draws = 0;    ///< GPU.hd_ui (log once)
+    u64 ui_resolves = 0;
     /// NAT-142: guest memory the GPU reads or writes in place (64 KB pages, every 8th frame):
     /// vertex buffers, indices, read-only storage through the page table, other storage
     /// buffers read, storage buffers written; NAT-150: then what is bound from video memory

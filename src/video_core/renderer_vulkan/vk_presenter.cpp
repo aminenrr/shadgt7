@@ -1352,7 +1352,8 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     // NAT-100: the picture native mode drew at the display buffer, through the same host passes.
     const VideoCore::TextureCache::ImageDesc desc{attribute, cpu_address};
     const vk::Format view_format = GetFrameViewFormat(attribute.attrib.pixel_format);
-    const auto display = native.FindDisplay(desc.info, view_format);
+    const auto display =
+        native.FindDisplay(desc.info, view_format, {expected_frame_width, expected_frame_height});
     if (!display) {
         return PrepareBlankFrame(false);
     }
@@ -1442,7 +1443,7 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
         .pImageMemoryBarriers = barriers.data(),
     });
-    const vk::Extent2D image_size{display->width, display->height};
+    vk::Extent2D image_size{display->width, display->height};
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
     vk::ImageView image_view = display->view;
     const vk::CommandBuffer pass_cmdbuf = draw_scheduler.DirectCommandBuffer();
@@ -1509,9 +1510,17 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         g_presenter_times.Begin(pass_cmdbuf, display->temporal.has_value() &&
                                                  RytyUpscale::TemporalActive());
     }
-    if (const auto dlss_view = dlss_pass.Render(
-            pass_cmdbuf, display->image, image_view, view_format, image_size, upscale_target,
-            display->temporal ? &*display->temporal : nullptr);
+    if (display->output_view) {
+        // GPU.hd_ui: the scene was scaled and the UI drawn at the output size already.
+        image_view = display->output_view;
+        image_size = display->output_size;
+        scaled = true;
+    }
+    if (const auto dlss_view =
+            scaled ? image_view
+                   : dlss_pass.Render(pass_cmdbuf, display->image, image_view, view_format,
+                                      image_size, upscale_target,
+                                      display->temporal ? &*display->temporal : nullptr);
         dlss_view != image_view) {
         image_view = dlss_view;
         scaled = true;
@@ -1588,7 +1597,7 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         .imageMemoryBarrierCount = 1,
         .pImageMemoryBarriers = &back,
     });
-    DebugState.game_resolution = {image_size.width, image_size.height};
+    DebugState.game_resolution = {display->width, display->height};
     DebugState.output_resolution = {frame->width, frame->height};
     if (pending_screenshot) { // DIAG-164
         draw_scheduler.DeferPriorityOperation(
