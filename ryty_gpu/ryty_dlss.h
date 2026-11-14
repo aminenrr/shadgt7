@@ -41,10 +41,13 @@ bool CanScale(vk::Extent2D input_size, vk::Extent2D output_size);
 
 /// GPU.hd_ui: scales the game picture (readable by shaders, in the shader-read layout) into an
 /// R16G16B16A16 output image with storage usage, left in the general layout. False when DLSS is
-/// off or failed.
+/// off or failed. `temporal` (pr-tests HDUI+TDLSS): the frame's depth, motion vectors and jitter for
+/// Streamline's temporal DLSS (DLSS-GT7-001), as the presenter's pass takes them; null for a
+/// single frame.
 bool ScaleInto(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::ImageView input,
                vk::Format input_format, vk::Extent2D input_size, vk::Image output_image,
-               vk::ImageView output, vk::Extent2D output_size);
+               vk::ImageView output, vk::Extent2D output_size,
+               const RytyUpscale::TemporalInputs* temporal = nullptr);
 
 /// Scales the game picture into an output image at the window size, like the FSR pass.
 class Pass {

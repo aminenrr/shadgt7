@@ -181,7 +181,8 @@ bool CanScale(vk::Extent2D input_size, vk::Extent2D output_size) {
 
 bool ScaleInto(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::ImageView input,
                vk::Format input_format, vk::Extent2D input_size, vk::Image output_image,
-               vk::ImageView output, vk::Extent2D output_size) {
+               vk::ImageView output, vk::Extent2D output_size,
+               const RytyUpscale::TemporalInputs* temporal) {
     if (!CanScale(input_size, output_size) || (g_streamline && !g_device)) {
         return false;
     }
@@ -215,7 +216,7 @@ bool ScaleInto(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::ImageView in
     if (g_streamline) {
         ok = RytyDlssG::Upscale(g_device, g_allocator, cmdbuf, input_image, input, input_format,
                                 input_size, output_image, output,
-                                vk::Format::eR16G16B16A16Sfloat, output_size);
+                                vk::Format::eR16G16B16A16Sfloat, output_size, temporal);
     } else {
         const RygtDlssImage in{
             .image = static_cast<VkImage>(input_image),

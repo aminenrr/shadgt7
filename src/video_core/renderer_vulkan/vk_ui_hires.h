@@ -409,17 +409,20 @@ inline vk::ImageBlit2 NativeBlit(vk::Extent2D from, vk::Extent2D to) {
 
 /// The scene composite in the native display image (general layout) becomes the proxy's
 /// picture: DLSS to the output size, or a linear blit. `allow_dlss` is off for a picture that
-/// has UI in it already.
+/// has UI in it already. `temporal` (pr-tests HDUI+TDLSS): the frame's inputs for temporal DLSS,
+/// null for a single frame.
 inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::Image image,
                           vk::ImageView view, vk::Format format, Proxy& proxy,
-                          bool allow_dlss = true) {
+                          bool allow_dlss = true,
+                          const RytyUpscale::TemporalInputs* temporal = nullptr) {
     const bool dlss = allow_dlss && !proxy.dlss_failed &&
                       RytyDlss::CanScale(proxy.native, proxy.size) && CreateScaled(instance, proxy);
     const auto input_layout =
         dlss ? vk::ImageLayout::eShaderReadOnlyOptimal : vk::ImageLayout::eTransferSrcOptimal;
     NativeBarrier(cmd, image, vk::ImageLayout::eGeneral, input_layout);
-    const bool scaled = dlss && RytyDlss::ScaleInto(cmd, image, view, format, proxy.native,
-                                                    proxy.scaled, *proxy.scaled_view, proxy.size);
+    const bool scaled =
+        dlss && RytyDlss::ScaleInto(cmd, image, view, format, proxy.native, proxy.scaled,
+                                    *proxy.scaled_view, proxy.size, temporal);
     if (dlss && !scaled) {
         proxy.dlss_failed = true;
         NativeBarrier(cmd, image, input_layout, vk::ImageLayout::eTransferSrcOptimal);

@@ -894,7 +894,10 @@ bool NativeRenderer::HudSplitOn() {
         const char* env = std::getenv("RYGT_HUD_SPLIT");
         // DLSS-GT7-001: the temporal prototype wants the HUD out of the picture DLSS scales (its
         // pixels would take the scene's motion vectors); it is laid over the result as here.
-        return (RytyDisplayAspect() > 0.0f || RytyUpscale::TemporalRequested()) &&
+        // pr-tests HDUI+TDLSS: not with GPU.hd_ui, whose proxy already keeps the UI out of the
+        // scene DLSS scales (it is drawn after, at the output size).
+        return (RytyDisplayAspect() > 0.0f ||
+                (RytyUpscale::TemporalRequested() && !UiHires::Enabled())) &&
                !(env && env[0] == '0');
     }();
     return on;
@@ -1017,7 +1020,8 @@ u32 NativeRenderer::HudScale() const {
         const char* env = std::getenv("RYGT_DLSS_TEMPORAL_HUD_SCALE");
         return !(env && env[0] == '1');
     }();
-    if (!wanted || !RytyUpscale::TemporalRequested() || RytyDisplayAspect() > 0.0f) {
+    if (!wanted || !RytyUpscale::TemporalRequested() || RytyDisplayAspect() > 0.0f ||
+        UiHires::Enabled()) { // pr-tests HDUI+TDLSS: the HUD is drawn at the output size there
         return 1;
     }
     return r.instance.GetMaxViewportWidth() >= 32768 && r.instance.GetMaxViewportHeight() >= 32768
@@ -5192,9 +5196,44 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
                 proxy.phase = UiHires::Phase::Off;
                 return;
             }
+            // pr-tests HDUI+TDLSS: in a race frame whose temporal pass was replaced with the
+            // un-resolved colour (DLSS-GT7-001), DLSS gets that frame's depth, motion vectors
+            // and jitter here, as the presenter's pass would; the UI is drawn after, at the
+            // output size. Menus ("mirror" frames) and anything that does not fit stay single.
+            std::optional<RytyUpscale::TemporalInputs> hd_temporal;
+            if (RytyUpscale::TemporalActive() && temporal.frame == frame &&
+                temporal.replaced_frame == frame && !temporal.mirror && temporal.depth &&
+                temporal.motion && temporal.depth->info.size.width == proxy.native.width &&
+                temporal.depth->info.size.height == proxy.native.height &&
+                temporal.motion->info.size.width == proxy.native.width &&
+                temporal.motion->info.size.height == proxy.native.height) {
+                VideoCore::ImageViewInfo depth_info{};
+                depth_info.format = vk::Format::eR32Sfloat;
+                VideoCore::ImageViewInfo motion_info{};
+                motion_info.format = vk::Format::eR16G16Sfloat;
+                RytyUpscale::TemporalInputs inputs{};
+                inputs.depth = vk::Image{Handle<VkImage_T>(temporal.depth->image->NativeHandle())};
+                inputs.depth_view = View(*temporal.depth, depth_info, ViewUse::Sampled);
+                inputs.depth_format = static_cast<vk::Format>(temporal.depth->image->Desc().format);
+                inputs.motion =
+                    vk::Image{Handle<VkImage_T>(temporal.motion->image->NativeHandle())};
+                inputs.motion_view = View(*temporal.motion, motion_info, ViewUse::Sampled);
+                inputs.motion_format =
+                    static_cast<vk::Format>(temporal.motion->image->Desc().format);
+                inputs.size = proxy.native;
+                inputs.jitter[0] = temporal.jitter[0];
+                inputs.jitter[1] = temporal.jitter[1];
+                inputs.mvec_scale[0] = temporal.mvec_scale[0];
+                inputs.mvec_scale[1] = temporal.mvec_scale[1];
+                inputs.reset = temporal.reset;
+                if (inputs.depth_view && inputs.motion_view) {
+                    hd_temporal = inputs;
+                }
+            }
             UiHires::UpscaleNative(r.instance, r.scheduler.DirectCommandBuffer(),
                                    vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
-                                   view, view_info.format, proxy, !proxy.native_dirty);
+                                   view, view_info.format, proxy, !proxy.native_dirty,
+                                   hd_temporal ? &*hd_temporal : nullptr);
         }
         // Allocate all auxiliary views before redirecting any attachment. Failed creation
         // takes one coherent native draw, with a rejoin on the next supported display draw.
