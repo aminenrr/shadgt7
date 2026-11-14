@@ -4977,7 +4977,8 @@ void NativeRenderer::PrepareMapIcons(const Targets& targets, const GraphicsPipel
         if (slot < 0 || size_t(slot) >= b.images.size()) {
             continue;
         }
-        b.images[slot].sampler = SamplerFor(ssharp, regs.ta_bc_base, false);
+        // (explicit_lod = true: the sprites keep their base mip, no DLSS-GT7-002 texture bias)
+        b.images[slot].sampler = SamplerFor(ssharp, regs.ta_bc_base, false, true);
     }
 }
 
