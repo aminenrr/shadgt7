@@ -1052,6 +1052,7 @@ int PS4_SYSV_ABI sceNpTrophyUnlockTrophy(OrbisNpTrophyContext context, OrbisNpTr
     int num_base_trophies = 0;
     int num_base_trophies_unlocked = 0;
     pugi::xml_node platinum_node;
+    bool unlocked_counts_for_platinum = false;
 
     // Outputs filled during the scan.
     bool trophy_found = false;
@@ -1076,8 +1077,16 @@ int PS4_SYSV_ABI sceNpTrophyUnlockTrophy(OrbisNpTrophyContext context, OrbisNpTr
             }
         }
 
-        if (node.attribute("pid").as_int(-1) != ORBIS_NP_TROPHY_INVALID_TROPHY_ID &&
-            node.attribute("gid").as_int(0) > 0) {
+        // FEAT-GT7-185: the trophies the platinum needs are the ones linked to it (pid set), as
+        // upstream shadPS4 counts them; "gid > 0" counted only DLC group trophies, so the platinum
+        // never unlocked on its own.
+        const bool counts_for_platinum =
+            current_trophy_type != "P" &&
+            node.attribute("pid").as_int(-1) != ORBIS_NP_TROPHY_INVALID_TROPHY_ID;
+        if (current_trophy_id == trophyId) {
+            unlocked_counts_for_platinum = counts_for_platinum;
+        }
+        if (counts_for_platinum) {
             num_base_trophies++;
             if (current_trophy_unlockstate) {
                 num_base_trophies_unlocked++;
@@ -1110,7 +1119,8 @@ int PS4_SYSV_ABI sceNpTrophyUnlockTrophy(OrbisNpTrophyContext context, OrbisNpTr
     std::string platinum_name;
     std::filesystem::path platinum_icon_path;
 
-    if (!platinum_node.attribute("unlockstate").as_bool()) {
+    if (platinum_node && !platinum_node.attribute("unlockstate").as_bool() &&
+        unlocked_counts_for_platinum) {
         if ((num_base_trophies - 1) == num_base_trophies_unlocked) {
             unlock_platinum = true;
             platinum_id = platinum_node.attribute("id").as_int(ORBIS_NP_TROPHY_INVALID_TROPHY_ID);
