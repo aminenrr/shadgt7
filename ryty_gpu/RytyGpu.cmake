@@ -29,6 +29,7 @@ set(RYTY_COMMON_SOURCES
     ryty_gpu/ryty_library.cpp
     ryty_gpu/ryty_core_shims.cpp
     ryty_gpu/ryty_stubs.cpp
+    ryty_gpu/ryty_app0.cpp
     src/core/file_format/npbind.cpp
 )
 # shadGT's Discord presence is not part of the Ryty build.
