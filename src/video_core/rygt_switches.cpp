@@ -71,6 +71,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|RYGT_COMPILE_LOW|flag|Shader compiling|off|1 = on (test)|Keeps driver compile and translate threads below normal priority whenever no draw waits for its pipeline (PERF-GT7-055 test).",
     "RYGTSW1|RYGT_COMPILE_NOTICE|flag|Shader compiling|on|0 = off|Shows an on-screen notice when draws have waited over 0.5 s for shaders to compile, so it isn't mistaken for a crash; 0 hides it.",
     "RYGTSW1|RYGT_COMPILE_PLAY_WIDTH|int|Shader compiling|2|pipeline builds at once in a race; clamped 1..the usual compile width|How many pipelines build at once during a race (FIX-GT7-109); more made the game's submits wait behind compiles.",
+    "RYGTSW1|RYGT_DIRECT_LOAD_GROUPS|flag|Shader compiling|on|0 = off|Reads of one buffer in a row share one direct-memory branch, so translated shaders are smaller and drivers compile them faster (PERF-GTS-473 port).",
     "RYGTSW1|RYGT_FOREGROUND_COMPILE|flag|Shader compiling|on|0 = off|A compute pipeline the GPU waits for builds above normal priority while other compiles stay throttled (PERF-GT7-032).",
     "RYGTSW1|RYGT_GPL|flag|Shader compiling|on|0 = off|Uses shared pipeline libraries with fast linking for tessellated pipelines (PERF-GT7-040 port); 0 turns them off.",
     "RYGTSW1|RYGT_KEPT_SHADOW_MAPS|flag|Shader compiling|on|0 = off|Draws into a track's whole-circuit shadow map wait for their pipeline and the map stays in video memory while unused (512 MB at most), so a first visit keeps far shadows (FIX-GT7-153).",
