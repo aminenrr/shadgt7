@@ -7,6 +7,7 @@
 // right with a fade, hold 4 s (+2.5 s for Platinum), out 280 ms ease-in; one Platinum light sweep.
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <chrono>
 #include <cmath>
@@ -110,7 +111,7 @@ public:
     void Draw() override;
     bool ShouldKeepDrawing() override {
         // Keeps the pop-up moving while the game shows no new frame (a load).
-        return active_;
+        return active_.load(std::memory_order_relaxed);
     }
 
     void LoadAssets();
@@ -126,8 +127,8 @@ private:
     std::mutex mutex_;
     std::deque<Toast> queue_;
 
-    // Render thread only.
-    bool active_ = false;
+    // Render thread only (active_ is also read by the video out thread's MustKeepDrawing).
+    std::atomic<bool> active_{false};
     Toast current_;
     RefCountedTexture art_;
     Clock::time_point t0_;
@@ -158,8 +159,8 @@ void TrophyToastUI::LoadAssets() {
         ImFontConfig cfg{};
         cfg.OversampleH = 2;
         cfg.OversampleV = 1;
-        const auto u8 = font_path.u8string();
-        const std::string utf8(u8.begin(), u8.end());
+        const auto font_u8 = font_path.u8string();
+        const std::string utf8(font_u8.begin(), font_u8.end());
         font_ = ImGui::GetIO().Fonts->AddFontFromFileTTF(utf8.c_str(), 30.0f, &cfg);
     }
     static const char* const cup_files[4] = {"bronze.png", "silver.png", "gold.png",
@@ -220,7 +221,7 @@ void TrophyToastUI::PlayGradeSound(int grade) {
 
 void TrophyToastUI::Start(Toast t) {
     current_ = std::move(t);
-    art_ = {};
+    art_ = RefCountedTexture{};
     const auto icon = FromUtf8(current_.icon);
     if (FileExists(icon)) {
         art_ = RefCountedTexture::DecodePngFile(icon);
@@ -319,7 +320,7 @@ void TrophyToastUI::Draw() {
         float p = std::clamp((ms - InMs - hold) / OutMs, 0.0f, 1.0f);
         if (p >= 1.0f) {
             active_ = false;
-            art_ = {};
+            art_ = RefCountedTexture{};
             return;
         }
         p = EaseIn(p);
