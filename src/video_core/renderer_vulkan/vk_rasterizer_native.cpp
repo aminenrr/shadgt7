@@ -10124,7 +10124,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                     temporal.ui_scene_address = targets.colors[0]->info.guest_address;
                 }
             }
-            if (RytyUpscale::TemporalUiJitter().load(std::memory_order_relaxed)) {
+            // pr-tests HDUI+TDLSS: with the HD interface the scene is scaled by DLSS into the
+            // proxy before the interface's first draw, so the interface lands on DLSS's picture
+            // (jitter already taken out) and must not be shifted: the shift made it shake by a
+            // pixel in menus with a 3D scene (world map, race prep).
+            if (RytyUpscale::TemporalUiJitter().load(std::memory_order_relaxed) &&
+                !UiHires::Enabled()) {
                 jitter_shift = true;
             }
         }
@@ -11103,16 +11108,7 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
     // Not with GT7-UW's wide screen (RytyDisplayAspect): there the menus' interface is split off
     // in the black and white HUD pictures and laid over DLSS's picture, where a jitter shift
     // would only make it shake (and its record over white is not shifted).
-    // pr-tests HDUI+TDLSS: with the HD interface on, a menu's interface is drawn into the HD UI
-    // proxy, not the display, so it is not shifted by the jitter while DLSS takes the jitter out
-    // of the scene: the interface shook by a pixel (world map, race prep). There the menus keep
-    // the game's own anti-aliasing (classic DLSS); races keep temporal DLSS.
-    // RYGT_DLSS_TEMPORAL_MENU_CLASSIC=0 turns that off.
-    static const bool hd_menu_classic = [] {
-        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_MENU_CLASSIC");
-        return UiHires::Enabled() && !(env && env[0] == '0');
-    }();
-    const bool through = !menu_classic && !hd_menu_classic && hud_mode == 0 && !menus_too &&
+    const bool through = !menu_classic && hud_mode == 0 && !menus_too &&
                          mirror_mode == 0 && !race_hud && RytyDisplayAspect() <= 0.0f;
     if (through) {
         temporal.through_frame = frame;
@@ -11123,8 +11119,8 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
                             : "a race's HUD: drawn apart at twice the size");
     }
     temporal.through = through;
-    const bool left = (menu_classic || hd_menu_classic) && hud_mode == 0 && !menus_too &&
-                      mirror_mode == 0 && !race_hud && (hd_menu_classic || read_back || fresh);
+    const bool left = menu_classic && hud_mode == 0 && !menus_too &&
+                      mirror_mode == 0 && !race_hud && (read_back || fresh);
     if (left != temporal.left && temporal.left_changes++ < 64) {
         LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: {}", frame,
                     !left ? "the temporal pass is taken"
