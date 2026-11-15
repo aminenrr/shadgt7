@@ -93,32 +93,41 @@ std::filesystem::path FindTrp(u32 service_label) {
     return {};
 }
 
-// TROPCONF.XML starts (after a BOM, white space and the <?xml ?> declaration) with <trophyconf:
-// a wrong key decrypts to bytes that do not.
+// A decrypted TROPCONF.XML is: optional BOM, the <?xml ?> declaration, Sony's
+// <!--Sce-Np-Trophy-Signature: ...--> comment (about 0x160 bytes), then <trophyconf. Skip the
+// declaration and any comments; as a fallback accept <trophyconf anywhere in the first 4 KB.
+// A wrong key decrypts to random bytes, which never contain it.
 bool LooksDecrypted(const std::filesystem::path& tropconf) {
     std::ifstream file{tropconf, std::ios::binary};
-    std::string head(512, '\0');
+    std::string head(4096, '\0');
     file.read(head.data(), static_cast<std::streamsize>(head.size()));
     head.resize(static_cast<std::size_t>(file.gcount()));
     std::string_view text(head);
-    const auto skip_space = [&text] {
-        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
-            text.remove_prefix(1);
-        }
-    };
     if (text.starts_with("\xEF\xBB\xBF")) {
         text.remove_prefix(3);
     }
-    skip_space();
-    if (text.starts_with("<?xml")) {
-        const auto end = text.find("?>");
-        if (end == std::string_view::npos) {
-            return false;
+    for (;;) {
+        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
+            text.remove_prefix(1);
         }
-        text.remove_prefix(end + 2);
-        skip_space();
+        std::string_view close;
+        if (text.starts_with("<?")) {
+            close = "?>";
+        } else if (text.starts_with("<!--")) {
+            close = "-->";
+        } else {
+            break;
+        }
+        const auto end = text.find(close);
+        if (end == std::string_view::npos) {
+            break;
+        }
+        text.remove_prefix(end + close.size());
     }
-    return text.starts_with("<trophyconf");
+    if (text.starts_with("<trophyconf")) {
+        return true;
+    }
+    return std::string_view(head).find("<trophyconf") != std::string_view::npos;
 }
 
 std::mutex g_mutex;
