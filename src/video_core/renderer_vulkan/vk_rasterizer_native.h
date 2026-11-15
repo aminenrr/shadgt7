@@ -397,6 +397,8 @@ private:
         const Native::ImageEntry* result = nullptr; ///< the pass's result picture
         u64 replaced_frame = ~u64{0}; ///< the frame the result was last replaced in place
         u64 through_frame = ~u64{0};  ///< the last menu frame whose interface goes through DLSS
+        u64 hd_ui_scene_frame = ~u64{0}; ///< pr-tests: a 3D draw after the composite gave the HD UI proxy up
+        u32 hd_ui_scene_logs = 0;
         u64 scene_draw_frame = ~u64{0}; ///< the frame the first draw into a display was seen in
         bool through = false;         ///< logged
         u32 through_changes = 0;      ///< logged

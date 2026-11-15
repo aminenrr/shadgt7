@@ -5109,6 +5109,38 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
                 return "depth-before-scene";
             }
             const auto& depth = *targets.depth;
+            // pr-tests HDUI+TDLSS: a draw into the display after the scene composite that tests
+            // the scene's own depth is 3D (seen in the garage), drawn with the game's jitter.
+            // Over the proxy's DLSS picture it would shake and stay aliased, so the proxy is
+            // given up for the frame and DLSS takes the whole display as with GPU.hd_ui off.
+            // RYGT_HD_UI_SCENE_DEPTH=0 turns this off.
+            static const bool scene_depth_guard = [] {
+                const char* env = std::getenv("RYGT_HD_UI_SCENE_DEPTH");
+                return !(env && env[0] == '0');
+            }();
+            if (scene_depth_guard && RytyUpscale::TemporalActive() && temporal.frame == frame &&
+                temporal.depth && depth.info.guest_address == temporal.depth->info.guest_address) {
+                if (temporal.hd_ui_scene_frame + 1 < frame && temporal.hd_ui_scene_logs++ < 32) {
+                    const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
+                    LOG_WARNING(Render_Vulkan,
+                                "HDUI: frame {}: a draw with the scene's depth after the "
+                                "composite (ps {:#x}): the proxy is given up, DLSS takes the "
+                                "whole display",
+                                frame, fs ? fs->pgm_hash : 0);
+                }
+                temporal.hd_ui_scene_frame = frame;
+                return "scene-depth-under-temporal-dlss";
+            }
+            if (RytyUpscale::TemporalActive() && temporal.frame == frame &&
+                temporal.hd_ui_scene_logs < 64 && frame % 600 == 0) {
+                ++temporal.hd_ui_scene_logs; // pr-tests diagnosis: other depth draws over the proxy
+                LOG_WARNING(Render_Vulkan,
+                            "HDUI: frame {}: a depth draw after the composite, depth {:#x} "
+                            "{}x{} (the scene's {:#x})",
+                            frame, depth.info.guest_address, depth.info.size.width,
+                            depth.info.size.height,
+                            temporal.depth ? temporal.depth->info.guest_address : 0);
+            }
             const auto& desc = depth.image->Desc();
             if (desc.dim != Native::Rhi::ImageDim::D2 || desc.depth != 1) {
                 return "depth-not-2d";
@@ -5161,7 +5193,8 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
             // A real MRT keeps every native output: the UI drawn so far goes down before this
             // draw, and the next supported draw copies the native display back up to the proxy,
             // without DLSS on a picture that has UI in it (native_dirty).
-            const bool rejoin = cb == 0 && entry->info.num_samples == 1 &&
+            const bool rejoin = cb == 0 && temporal.hd_ui_scene_frame != frame &&
+                                entry->info.num_samples == 1 &&
                                 entry->info.resources.layers == 1 &&
                                 entry->info.resources.levels == 1 &&
                                 entry->info.size.width == proxy.native.width &&
@@ -10129,7 +10162,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             // (jitter already taken out) and must not be shifted: the shift made it shake by a
             // pixel in menus with a 3D scene (world map, race prep).
             if (RytyUpscale::TemporalUiJitter().load(std::memory_order_relaxed) &&
-                !UiHires::Enabled()) {
+                (!UiHires::Enabled() || temporal.hd_ui_scene_frame == frame)) {
                 jitter_shift = true;
             }
         }
