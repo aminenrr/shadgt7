@@ -478,6 +478,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     // FEAT-GT7-186
     "RYGTSW1|RYGT_TROPHY_TOAST|flag|Trophies|on|0 = off|Shows the PS5-style trophy pop-up (top right, with the grade's sound) when a trophy unlocks; 0 hides it (unlocks are still logged and saved).",
     "RYGTSW1|RYGT_TROPHY_TOAST_TEST|string|Trophies|off|1 = a Gold demo; B, S, G or P = a demo of that grade|Shows one demo trophy pop-up 5 s after the game starts, to check its look and sound without unlocking anything.",
+    "RYGTSW1|RYGT_TROPHY_PROGRESS_SD|flag|Trophies|on|0 = old place|Keeps trophy progress next to the saves in _sd\\trophies_progress (copied once from user\\home\\<1000+slot>\\trophy, which stays as a backup); 0 uses the old user\\home place.",
 };
 
 RYGT_SWITCH_EXPORT const std::size_t RyGT_SwitchDescriptionCount = std::size(RyGT_SwitchDescriptions);

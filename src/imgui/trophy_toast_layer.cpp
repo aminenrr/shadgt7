@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
+#include <initializer_list>
 #include <mutex>
 #include <string>
 #include <system_error>
@@ -152,9 +153,29 @@ void TrophyToastUI::LoadAssets() {
             test_grade_ = env[0];
         }
     }
-    const auto dir = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "trophy_assets";
-    const auto font_path = dir / "fonts" / "SSTRg.ttf";
-    if (FileExists(font_path)) {
+    // FEAT-GT7-189: each file comes from the player's custom folder (user\trophy_assets) when it
+    // is there, else from the launcher's built-in set (user\trophy_builtin, written at Play).
+    // Older names (Trophy-Notifier's) are still accepted in the custom folder.
+    const auto user_dir = Common::FS::GetUserPath(Common::FS::PathType::UserDir);
+    const auto custom = user_dir / "trophy_assets";
+    const auto builtin = user_dir / "trophy_builtin";
+    int custom_files = 0;
+    const auto pick = [&](std::initializer_list<const char*> names) -> std::filesystem::path {
+        for (const char* name : names) {
+            if (FileExists(custom / name)) {
+                ++custom_files;
+                return custom / name;
+            }
+        }
+        for (const char* name : names) {
+            if (FileExists(builtin / name)) {
+                return builtin / name;
+            }
+        }
+        return {};
+    };
+    const auto font_path = pick({"font.ttf", "font.otf", "fonts/SSTRg.ttf"});
+    if (!font_path.empty()) {
         // ImGui 1.92 renders any size from one font, so it is added once (sizes come with AddText).
         ImFontConfig cfg{};
         cfg.OversampleH = 2;
@@ -167,23 +188,20 @@ void TrophyToastUI::LoadAssets() {
                                              "platinum.png"};
     int cups = 0;
     for (int i = 0; i < 4; ++i) {
-        const auto p = dir / cup_files[i];
-        if (FileExists(p)) {
+        if (const auto p = pick({cup_files[i]}); !p.empty()) {
             cups_[i] = RefCountedTexture::DecodePngFile(p);
             ++cups;
         }
     }
-    if (FileExists(dir / "ps5_trophy.wav")) {
-        wav_trophy_ = dir / "ps5_trophy.wav";
-    }
-    if (FileExists(dir / "ps5_platinum.wav")) {
-        wav_platinum_ = dir / "ps5_platinum.wav";
-    }
+    wav_trophy_ = pick({"trophy.wav", "ps5_trophy.wav"});
+    wav_platinum_ = pick({"platinum.wav", "ps5_platinum.wav"});
     LOG_INFO(Lib_NpTrophy,
-             "FEAT-GT7-186 trophy toast: {}; assets {}: font {}, {} cup images, sounds {}/{}{}",
-             Enabled() ? "on" : "off (RYGT_TROPHY_TOAST=0)", Common::FS::PathToUTF8String(dir),
-             font_ ? "SSTRg.ttf" : "default", cups, wav_trophy_.empty() ? "no" : "yes",
-             wav_platinum_.empty() ? "no" : "yes",
+             "FEAT-GT7-186 trophy toast: {}; font {}, {} cup images, sounds {}/{}, {} custom "
+             "file(s) from {}{}",
+             Enabled() ? "on" : "off (RYGT_TROPHY_TOAST=0)",
+             font_ ? Common::FS::PathToUTF8String(font_path.filename()) : std::string("default"),
+             cups, wav_trophy_.empty() ? "no" : "yes", wav_platinum_.empty() ? "no" : "yes",
+             custom_files, Common::FS::PathToUTF8String(custom),
              test_pending_ ? "; test toast in 5 s (RYGT_TROPHY_TOAST_TEST)" : "");
 }
 

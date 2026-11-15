@@ -142,9 +142,23 @@ s64 TrophyUserFolder(s64 user_id) {
     return user_id;
 }
 
+std::filesystem::path TrophyProgressFile(s64 user_id, const std::string& np_comm_id,
+                                         const std::filesystem::path& legacy) {
+    if (const char* env = std::getenv("RYGT_TROPHY_PROGRESS_SD"); env && env[0] == '0') {
+        return legacy;
+    }
+    const s64 folder = TrophyUserFolder(user_id);
+    auto dir = std::filesystem::current_path() / "_sd" / "trophies_progress";
+    if (folder != 1000) {
+        dir /= std::to_string(folder);
+    }
+    return dir / (np_comm_id + ".xml");
+}
+
 void PrepareTrophies(const std::string& np_comm_id, u32 service_label,
                      const std::filesystem::path& extract_dir,
-                     const std::filesystem::path& user_xml) {
+                     const std::filesystem::path& user_xml,
+                     const std::filesystem::path& legacy_xml) {
     std::scoped_lock lock{g_mutex};
     std::error_code error;
     const auto tropconf = extract_dir / "Xml" / "TROPCONF.XML";
@@ -195,6 +209,20 @@ void PrepareTrophies(const std::string& np_comm_id, u32 service_label,
     // fallback).
     if (std::filesystem::exists(user_xml, error)) {
         return;
+    }
+    // FEAT-GT7-189: progress kept in the old place (user\home) moves with the player; the old file
+    // stays as a backup.
+    if (legacy_xml != user_xml && std::filesystem::is_regular_file(legacy_xml, error)) {
+        std::filesystem::create_directories(user_xml.parent_path(), error);
+        std::error_code copy_error;
+        std::filesystem::copy_file(legacy_xml, user_xml, copy_error);
+        if (!copy_error) {
+            LOG_INFO(Lib_NpTrophy, "FEAT-GT7-189 ok: trophy progress copied from {} to {}",
+                     U8(legacy_xml), U8(user_xml));
+            return;
+        }
+        LOG_ERROR(Lib_NpTrophy, "FEAT-GT7-189 fail: could not copy {} to {}: {}", U8(legacy_xml),
+                  U8(user_xml), copy_error.message());
     }
     auto source = extract_dir / "Xml" / "TROP.XML";
     if (!std::filesystem::is_regular_file(source, error)) {

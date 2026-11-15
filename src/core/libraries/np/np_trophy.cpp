@@ -915,10 +915,14 @@ int PS4_SYSV_ABI sceNpTrophyRegisterContext(OrbisNpTrophyContext context,
         // FEAT-GT7-185: Ryty's user IDs (0x10000000 + slot) use shadGT's user folders (1000 +
         // slot), and the trophy set is extracted (with the launcher's key) and the user's unlock
         // file seeded here, as shadGT's loader does at boot.
-        ctx.xml_save_file = EmulatorSettings.GetHomeDir() /
-                            std::to_string(Ryty::TrophyUserFolder(ctx.user_id)) / "trophy" /
-                            (np_comm_id + ".xml");
-        Ryty::PrepareTrophies(np_comm_id, ctx.service_label, trophy_base, ctx.xml_save_file);
+        // FEAT-GT7-189: the unlock file lives with the saves (_sd\trophies_progress); the old
+        // user\home file is copied there once. RYGT_TROPHY_PROGRESS_SD=0 keeps the old place.
+        const auto legacy_xml = EmulatorSettings.GetHomeDir() /
+                                std::to_string(Ryty::TrophyUserFolder(ctx.user_id)) / "trophy" /
+                                (np_comm_id + ".xml");
+        ctx.xml_save_file = Ryty::TrophyProgressFile(ctx.user_id, np_comm_id, legacy_xml);
+        Ryty::PrepareTrophies(np_comm_id, ctx.service_label, trophy_base, ctx.xml_save_file,
+                              legacy_xml);
         LOG_INFO(Lib_NpTrophy, "FEAT-GT7-185: user {:#x} unlock file {}", ctx.user_id,
                  Common::FS::PathToUTF8String(ctx.xml_save_file));
 #else
