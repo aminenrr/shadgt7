@@ -362,6 +362,7 @@ private:
     /// GT7-UW: small pictures drawn with a depth buffer, and the frame (a race HUD's track
     /// and course maps are drawn so every frame; menus' HUDs take none).
     std::unordered_map<VAddr, u64> hud_depth_drawn; ///< by address
+    std::unordered_map<VAddr, u64> hd_race_depth_drawn; ///< pr-tests: the same, with GPU.hd_ui
     std::unordered_map<VAddr, HudLayer> hud_layers;
     static bool HudSplitOn();
 
@@ -399,6 +400,11 @@ private:
         u64 through_frame = ~u64{0};  ///< the last menu frame whose interface goes through DLSS
         u64 hd_ui_scene_frame = ~u64{0}; ///< pr-tests: a 3D draw after the composite gave the HD UI proxy up
         u32 hd_ui_scene_logs = 0;
+        u64 hd_race_frame = ~u64{0};  ///< pr-tests: a race HUD seen with GPU.hd_ui
+        u64 hd_menu_safe_frame = ~u64{0}; ///< pr-tests: a 3D menu frame HD UI steps aside in
+        u64 hd_trace_frame = ~u64{0}; ///< pr-tests: the frame whose display draws are logged
+        u32 hd_trace_draws = 0;
+        u32 hd_trace_samples = 0;
         u64 scene_draw_frame = ~u64{0}; ///< the frame the first draw into a display was seen in
         bool through = false;         ///< logged
         u32 through_changes = 0;      ///< logged

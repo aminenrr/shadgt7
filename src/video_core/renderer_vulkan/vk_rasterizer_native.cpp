@@ -5004,7 +5004,24 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
         }
         auto& proxy = found->second;
         // Why this draw cannot render into the proxy, or null when it can.
+        if (temporal.hd_trace_frame == frame && cb == 0 && temporal.hd_trace_draws < 48) {
+            const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
+            LOG_WARNING(Render_Vulkan,
+                        "HDUI-TRACE: frame {} draw {} into {:#x}: phase {}, ps {:#x}, depth {:#x}"
+                        "{}",
+                        frame, temporal.hd_trace_draws++, entry->info.guest_address,
+                        static_cast<int>(proxy.phase), fs ? fs->pgm_hash : 0,
+                        targets.depth ? targets.depth->info.guest_address : 0,
+                        targets.depth && temporal.depth &&
+                                targets.depth->info.guest_address ==
+                                    temporal.depth->info.guest_address
+                            ? " (the scene's depth)"
+                            : "");
+        }
         const char* unsupported_reason = [&]() -> const char* {
+            if (temporal.hd_menu_safe_frame == frame) {
+                return "3d-menu-safe";
+            }
             if (cb != 0) {
                 return "display-not-slot-zero";
             }
@@ -10180,6 +10197,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         targets.colors[0]->info.size.width <= 1024 && targets.colors[0]->info.size.height <= 600) {
         hud_depth_drawn[targets.colors[0]->info.guest_address] = frame;
     }
+    if (UiHires::Enabled() && RytyUpscale::TemporalRequested() && targets.colors[0] &&
+        targets.depth && targets.colors[0]->info.num_samples > 1 &&
+        targets.colors[0]->info.size.width <= 1024 && targets.colors[0]->info.size.height <= 600) {
+        hd_race_depth_drawn[targets.colors[0]->info.guest_address] = frame; // pr-tests
+    }
     if (HudSplitNow() && targets.colors[0] &&
         targets.state.num_color_attachments == 1 &&
         IsDisplayAddress(targets.colors[0]->info.guest_address)) {
@@ -10277,6 +10299,21 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     // GT7-UW: a HUD draw showing a small picture drawn with depth this frame (the race's maps).
     // DLSS-GT7-001: the same sign, without a HUD layer, tells the prototype a race is on.
     const auto note_race_hud = [&] {
+        // pr-tests: a race's HUD under GPU.hd_ui (track and course maps drawn with depth), for
+        // RYGT_HD_UI_3D_MENU_SAFE only; the race keeps the way it is drawn.
+        if (UiHires::Enabled() && temporal.hd_race_frame != frame && targets.colors[0] &&
+            IsDisplayAddress(targets.colors[0]->info.guest_address)) {
+            for (const auto* sampled : b.sampled) {
+                if (!sampled) {
+                    continue;
+                }
+                const auto it = hd_race_depth_drawn.find(sampled->info.guest_address);
+                if (it != hd_race_depth_drawn.end() && it->second == frame) {
+                    temporal.hd_race_frame = frame;
+                    break;
+                }
+            }
+        }
         const bool for_layer = hud_layer && hud_layer->race_frame != frame;
         const bool for_temporal =
             RytyUpscale::TemporalRequested() && temporal.race_hud_frame != frame &&
@@ -11152,6 +11189,40 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
                             : "a race's HUD: drawn apart at twice the size");
     }
     temporal.through = through;
+    // pr-tests HDUI+TDLSS (RYGT_HD_UI_3D_MENU_SAFE, on unless =0): in a menu with a 3D scene
+    // (a temporal pass and no race HUD) HD UI steps aside for the frame, which then goes the way
+    // it does with GPU.hd_ui off (stable there; the 3D shook under the HD UI proxy in the
+    // rewards, cafe, used car and brand store scenes). Races and flat menus keep HD UI.
+    static const bool menu_safe = [] {
+        const char* env = std::getenv("RYGT_HD_UI_3D_MENU_SAFE");
+        return !(env && env[0] == '0');
+    }();
+    {
+        const bool hd_race =
+            temporal.hd_race_frame != ~u64{0} && frame - temporal.hd_race_frame <= 2;
+        const bool safe = menu_safe && UiHires::Enabled() && !hd_race;
+        if (safe) {
+            temporal.hd_menu_safe_frame = frame;
+            temporal.hd_ui_scene_frame = frame; // no rejoin, the UI's jitter shift as hd_ui off
+        }
+        static bool safe_logged = false;
+        static u32 safe_changes = 0;
+        if (UiHires::Enabled() && safe != safe_logged && safe_changes++ < 64) {
+            LOG_WARNING(Render_Vulkan, "HDUI: frame {}: {}", frame,
+                        safe ? "a 3D menu: HD UI steps aside (RYGT_HD_UI_3D_MENU_SAFE)"
+                             : (hd_race ? "a race: HD UI on" : "HD UI on"));
+        }
+        safe_logged = safe;
+        // B (diagnosis): every 600 frames, the display draws of one frame with a temporal pass.
+        if (UiHires::Enabled() && frame % 600 == 0 && temporal.hd_trace_samples < 40) {
+            ++temporal.hd_trace_samples;
+            temporal.hd_trace_frame = frame;
+            temporal.hd_trace_draws = 0;
+            LOG_WARNING(Render_Vulkan, "HDUI-TRACE: frame {}: {} (temporal out {:#x})", frame,
+                        hd_race ? "race" : "3D menu",
+                        temporal.pending_out ? temporal.pending_out->info.guest_address : 0);
+        }
+    }
     const bool left = menu_classic && hud_mode == 0 && !menus_too &&
                       mirror_mode == 0 && !race_hud && (read_back || fresh);
     if (left != temporal.left && temporal.left_changes++ < 64) {
