@@ -508,6 +508,7 @@ struct Streamline {
     vk::Extent2D sr_in{}, sr_out{};
     int sr_mode = -1; // DLSSMode for sr_in -> sr_out, -1 when not supported
     bool sr_options_set{};
+    bool sr_side_options_set{}; ///< pr-tests: viewport 2, single frames beside temporal ones
     // The frame token the upscaler (draw thread) started for the next presented frame; frame
     // generation's Prepare (present thread) carries on with it instead of starting another.
     // Kept apart from frame, which the present thread's markers use for the frame on screen.
@@ -1019,6 +1020,7 @@ bool UpscaleSupports(vk::Extent2D input, vk::Extent2D output) {
         g_sl.sr_out = output;
         g_sl.sr_mode = FindMode(input, output);
         g_sl.sr_options_set = false;
+        g_sl.sr_side_options_set = false;
         LOG_WARNING(Render_Vulkan, "ryGT DLSS: {}x{} to {}x{}: {}", input.width, input.height,
                     output.width, output.height,
                     g_sl.sr_mode < 0 ? std::string{"no DLSS mode fits; using FSR"}
@@ -1036,24 +1038,6 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
         return false;
     }
     std::scoped_lock lock{g_sl.mutex};
-    const sl::ViewportHandle viewport{1u};
-    if (!g_sl.sr_options_set) {
-        sl::DLSSOptions options{};
-        options.mode = static_cast<sl::DLSSMode>(g_sl.sr_mode);
-        options.outputWidth = output_size.width;
-        options.outputHeight = output_size.height;
-        options.colorBuffersHDR = sl::Boolean::eFalse;
-        const sl::Result set = g_sl.dlss_set_options(viewport, options);
-        if (set != sl::Result::eOk) {
-            LOG_ERROR(Render_Vulkan, "ryGT DLSS: Streamline refused the options (result {})",
-                      static_cast<int>(set));
-            return false;
-        }
-        g_sl.sr_options_set = true;
-    }
-    if (!g_sl.sr.Ready(input_size)) {
-        CreateAuxImages(g_sl.sr, device, allocator, cmdbuf, input_size);
-    }
     // DLSS-GT7-001 (temporal DLSS; ryty_upscale.h): with the frame's own depth,
     // motion vectors and jitter, DLSS keeps its history from frame to frame. A refusal from
     // Streamline ends the prototype for the run, and the frame is scaled as before.
@@ -1069,6 +1053,41 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     const bool use_temporal = temporal && !temporal_refused && !temporal_paused &&
                               temporal->size == input_size &&
                               temporal->depth_view && temporal->motion_view;
+    // pr-tests: a single frame asked for right after a temporal one (with GPU.hd_ui a menu with a
+    // 3D scene asked DLSS for both, turn about, every frame) runs on DLSS's second viewport: on
+    // the first it reset the temporal history every frame (the 3D shook) and flipped the
+    // temporal status the interface's jitter shift reads (the icons jittered).
+    // RYGT_DLSS_SIDE_VIEWPORT=0 keeps the old way.
+    static const bool side_wanted = [] {
+        const char* env = std::getenv("RYGT_DLSS_SIDE_VIEWPORT");
+        return !(env && env[0] == '0');
+    }();
+    static u64 calls = 0;
+    static u64 last_temporal_call = 0;
+    static u64 side_frames = 0;
+    ++calls;
+    const bool side = side_wanted && !use_temporal && last_temporal && !temporal_refused &&
+                      RytyUpscale::TemporalRequested() && last_temporal_call != 0 &&
+                      calls - last_temporal_call <= 3;
+    const sl::ViewportHandle viewport{side ? 2u : 1u};
+    bool& options_set = side ? g_sl.sr_side_options_set : g_sl.sr_options_set;
+    if (!options_set) {
+        sl::DLSSOptions options{};
+        options.mode = static_cast<sl::DLSSMode>(g_sl.sr_mode);
+        options.outputWidth = output_size.width;
+        options.outputHeight = output_size.height;
+        options.colorBuffersHDR = sl::Boolean::eFalse;
+        const sl::Result set = g_sl.dlss_set_options(viewport, options);
+        if (set != sl::Result::eOk) {
+            LOG_ERROR(Render_Vulkan, "ryGT DLSS: Streamline refused the options (result {})",
+                      static_cast<int>(set));
+            return false;
+        }
+        options_set = true;
+    }
+    if (!g_sl.sr.Ready(input_size)) {
+        CreateAuxImages(g_sl.sr, device, allocator, cmdbuf, input_size);
+    }
     const auto run = [&](const RytyUpscale::TemporalInputs* t) -> bool {
     sl::FrameToken* frame{};
     ++g_sl.frame_index;
@@ -1200,6 +1219,19 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     if (!ok) {
         ok = run(nullptr);
     }
+    if (ran_temporal) {
+        last_temporal_call = calls;
+    }
+    if (ok && side) {
+        // Beside the temporal frames: their history, counts and status stay as they are.
+        if (side_frames++ % 600 == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "DLSS-GT7-001: a single frame beside the temporal ones runs on DLSS's "
+                        "second viewport ({} so far, {} temporal frames), input {}x{}",
+                        side_frames, temporal_frames, input_size.width, input_size.height);
+        }
+        return true;
+    }
     if (ok) {
         if (ran_temporal != last_temporal && RytyUpscale::TemporalRequested()) {
             LOG_WARNING(Render_Vulkan,
@@ -1244,6 +1276,7 @@ void Shutdown() {
     g_sl.sr_in = g_sl.sr_out = {};
     g_sl.sr_mode = -1;
     g_sl.sr_options_set = false;
+    g_sl.sr_side_options_set = false;
 }
 
 } // namespace Vulkan::RytyDlssG

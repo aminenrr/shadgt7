@@ -5130,10 +5130,10 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
             // the scene's own depth is 3D (seen in the garage), drawn with the game's jitter.
             // Over the proxy's DLSS picture it would shake and stay aliased, so the proxy is
             // given up for the frame and DLSS takes the whole display as with GPU.hd_ui off.
-            // RYGT_HD_UI_SCENE_DEPTH=0 turns this off.
+            // RYGT_HD_UI_SCENE_DEPTH=1 turns this on (off by default: it never fired in a test).
             static const bool scene_depth_guard = [] {
                 const char* env = std::getenv("RYGT_HD_UI_SCENE_DEPTH");
-                return !(env && env[0] == '0');
+                return env && env[0] == '1';
             }();
             if (scene_depth_guard && RytyUpscale::TemporalActive() && temporal.frame == frame &&
                 temporal.depth && depth.info.guest_address == temporal.depth->info.guest_address) {
@@ -5279,6 +5279,23 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
                 inputs.reset = temporal.reset;
                 if (inputs.depth_view && inputs.motion_view) {
                     hd_temporal = inputs;
+                }
+            }
+            // pr-tests (diagnosis): why the HD UI proxy scales this frame without the temporal
+            // inputs while temporal DLSS is on (it then runs DLSS on a single frame).
+            if (!hd_temporal && RytyUpscale::TemporalActive() && !proxy.native_dirty) {
+                static u32 single_logs = 0;
+                if (single_logs++ < 48) {
+                    LOG_WARNING(Render_Vulkan,
+                                "HDUI-SINGLE: frame {}: proxy {:#x} {}x{} scaled without temporal "
+                                "inputs: pass frame {}, replaced frame {}, mirror {}, depth {}, "
+                                "motion {}",
+                                frame, entry->info.guest_address, proxy.native.width,
+                                proxy.native.height,
+                                temporal.frame == ~u64{0} ? 0 : temporal.frame,
+                                temporal.replaced_frame == ~u64{0} ? 0 : temporal.replaced_frame,
+                                temporal.mirror, temporal.depth != nullptr,
+                                temporal.motion != nullptr);
                 }
             }
             UiHires::UpscaleNative(r.instance, r.scheduler.DirectCommandBuffer(),
@@ -11195,7 +11212,7 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
     // rewards, cafe, used car and brand store scenes). Races and flat menus keep HD UI.
     static const bool menu_safe = [] {
         const char* env = std::getenv("RYGT_HD_UI_3D_MENU_SAFE");
-        return !(env && env[0] == '0');
+        return env && env[0] == '1'; // pr-tests: off by default now, =1 turns it on
     }();
     {
         const bool hd_race =
