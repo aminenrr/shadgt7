@@ -889,7 +889,7 @@ static vk::Extent2D ShownPart(const Native::ImageEntry& picture) {
     return size;
 }
 
-// pr-tests HDUI+TDLSS (RYGT_HD_UI_MENU_TDLSS=1, off by default): with GPU.hd_ui, menus with a
+// pr-tests HDUI+TDLSS (RYGT_HD_UI_MENU_TDLSS, on by default; =0 off): with GPU.hd_ui, menus with a
 // 3D scene take temporal DLSS again; the HD UI proxy gets the frame's depth, motion and jitter
 // (the picture drawn beside in a mirror frame). Where it cannot, the menu falls back to the
 // game's resolved picture (RYGT_HD_UI_MENU_TEMPORAL off, 57200074) for a second.
@@ -898,7 +898,12 @@ static vk::Extent2D ShownPart(const Native::ImageEntry& picture) {
 static int HdUiMenuTdlssLevel() {
     static const int level = [] {
         const char* env = std::getenv("RYGT_HD_UI_MENU_TDLSS");
-        return env && (env[0] == '1' || env[0] == '2') ? env[0] - '0' : 0;
+        // On by default since 2026-11-16 (tested: no shimmer anywhere, sharper than =0's
+        // resolved picture); =0 turns it off, =2 as before.
+        if (env && env[0] == '0') {
+            return 0;
+        }
+        return env && env[0] == '2' ? 2 : 1;
     }();
     return level;
 }
