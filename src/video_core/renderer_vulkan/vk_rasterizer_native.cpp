@@ -11264,6 +11264,30 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
     if (left) {
         return;
     }
+    // pr-tests HDUI+TDLSS (RYGT_HD_UI_MENU_TEMPORAL, off unless =1): with HD UI, outside a race
+    // the game's own resolved picture is kept (no temporal pass), as with RYGT_DLSS_TEMPORAL=0.
+    // There the shown picture is scaled as a single frame, so the unresolved one the temporal
+    // pass hands over showed its jitter (cafe book, garage scapes, used cars). Races keep it.
+    {
+        static const bool menu_temporal = [] {
+            const char* env = std::getenv("RYGT_HD_UI_MENU_TEMPORAL");
+            return env && env[0] == '1';
+        }();
+        const bool hd_race =
+            temporal.hd_race_frame != ~u64{0} && frame - temporal.hd_race_frame <= 2;
+        const bool keep = UiHires::Enabled() && !menu_temporal && !hd_race;
+        static bool keep_logged = false;
+        static u32 keep_changes = 0;
+        if (UiHires::Enabled() && keep != keep_logged && keep_changes++ < 64) {
+            LOG_WARNING(Render_Vulkan, "HDUI-MENU: frame {}: {}", frame,
+                        keep ? "outside a race: the game's resolved picture is kept (no temporal)"
+                             : "a race: temporal DLSS");
+        }
+        keep_logged = keep;
+        if (keep) {
+            return;
+        }
+    }
     const auto refuse = [&](const char* why) {
         if (temporal.refused++ < 8) {
             LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: the temporal pass is not used: {}",
