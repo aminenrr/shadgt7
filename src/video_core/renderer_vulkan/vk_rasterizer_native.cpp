@@ -893,10 +893,28 @@ static vk::Extent2D ShownPart(const Native::ImageEntry& picture) {
 // 3D scene take temporal DLSS again; the HD UI proxy gets the frame's depth, motion and jitter
 // (the picture drawn beside in a mirror frame). Where it cannot, the menu falls back to the
 // game's resolved picture (RYGT_HD_UI_MENU_TEMPORAL off, 57200074) for a second.
-static bool HdUiMenuTdlss() {
-    static const bool on = [] {
+// =2 also gives the proxy up for a frame when a draw with a depth target of the display's size
+// comes after the composite in a temporal frame (3D drawn over the proxy on its own depth).
+static int HdUiMenuTdlssLevel() {
+    static const int level = [] {
         const char* env = std::getenv("RYGT_HD_UI_MENU_TDLSS");
-        return env && env[0] == '1';
+        return env && (env[0] == '1' || env[0] == '2') ? env[0] - '0' : 0;
+    }();
+    return level;
+}
+static bool HdUiMenuTdlss() {
+    return HdUiMenuTdlssLevel() != 0;
+}
+// pr-tests HDUI late scene (RYGT_HD_UI_LATE_SCENE=1, on with RYGT_HD_UI_MENU_TDLSS too; off by
+// default): in some menus (cafe book, garage Scapes) something is drawn into the display before
+// GT7's anti-aliasing pass, so the HD UI proxy scales early and the scene's composite then lands
+// in the proxy like a UI draw, without DLSS (edge shimmer while a subtitle is up). There the
+// proxy is copied back down, the composite is drawn natively, and the proxy scales at the next
+// display draw (with the temporal inputs when the pass was taken).
+static bool HdUiLateScene() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_HD_UI_LATE_SCENE");
+        return (env && env[0] == '1') || HdUiMenuTdlss();
     }();
     return on;
 }
@@ -5030,6 +5048,36 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
                             ? " (the scene's depth)"
                             : "");
         }
+        // pr-tests HDUI late scene: the composite found the proxy already scaled this frame.
+        if (cb == 0 && temporal.composite_now && proxy.phase == UiHires::Phase::Ui) {
+            ++temporal.hd_late_restarts;
+            const bool restart = HdUiLateScene();
+            if (!restart) {
+                ++temporal.hd_late_missed;
+            }
+            if (temporal.hd_late_logs < 24 &&
+                (temporal.hd_late_logs < 8 || frame % 600 < 2)) {
+                ++temporal.hd_late_logs;
+                const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
+                LOG_WARNING(Render_Vulkan,
+                            "HDUI-SRC: frame {}: late scene: the composite (ps {:#x}) comes after "
+                            "the proxy scaled; {} ({} late frames, {} left as before)",
+                            frame, fs ? fs->pgm_hash : 0,
+                            restart ? "the proxy is copied back down, the composite drawn "
+                                      "natively, the proxy scales at the next display draw"
+                                    : "drawn into the proxy as before (RYGT_HD_UI_LATE_SCENE off)",
+                            temporal.hd_late_restarts, temporal.hd_late_missed);
+            }
+            if (restart) {
+                lock.unlock();
+                ResolveUiDisplay(entry->info.guest_address, false);
+                lock.lock();
+                // The composite covers what was drawn before it: the next scale may use DLSS.
+                proxy.phase = UiHires::Phase::Scene;
+                proxy.native_dirty = false;
+                return;
+            }
+        }
         const char* unsupported_reason = [&]() -> const char* {
             if (temporal.hd_menu_safe_frame == frame) {
                 return "3d-menu-safe";
@@ -5159,6 +5207,23 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
                 }
                 temporal.hd_ui_scene_frame = frame;
                 return "scene-depth-under-temporal-dlss";
+            }
+            // RYGT_HD_UI_MENU_TDLSS=2: any depth of the display's size after the composite in a
+            // temporal frame (garage 3D drawn on its own depth over the proxy's DLSS picture).
+            if (HdUiMenuTdlssLevel() == 2 && RytyUpscale::TemporalActive() &&
+                temporal.frame == frame && temporal.replaced_frame == frame &&
+                depth.info.size.width == proxy.native.width &&
+                depth.info.size.height == proxy.native.height) {
+                if (temporal.hd_ui_scene_frame != frame && temporal.hd_depth_giveups++ < 16) {
+                    const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
+                    LOG_WARNING(Render_Vulkan,
+                                "HDUI-SRC: frame {}: a depth draw after the composite (ps {:#x}, "
+                                "depth {:#x}): the proxy is given up, DLSS takes the whole "
+                                "display (RYGT_HD_UI_MENU_TDLSS=2)",
+                                frame, fs ? fs->pgm_hash : 0, depth.info.guest_address);
+                }
+                temporal.hd_ui_scene_frame = frame;
+                return "depth-under-temporal-dlss";
             }
             if (RytyUpscale::TemporalActive() && temporal.frame == frame &&
                 temporal.hd_ui_scene_logs < 64 && frame % 600 == 0) {
@@ -5385,7 +5450,8 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
                             "HDUI-SRC: frame {}: proxy {:#x} {}x{} takes the {}{}: pass {}, "
                             "replaced {}, mirror {}, through {}, left {}, race HUD {}, read-back "
                             "{}, HD race {}, depth {}x{}, motion {}x{}, beside {}x{} (frame {}), "
-                            "switch {}, native dirty {} ({} menu frames temporal, {} fell back)",
+                            "switch {}, native dirty {} ({} menu frames temporal, {} fell back, "
+                            "{} late scene, {} of them left as before)",
                             frame, entry->info.guest_address, proxy.native.width,
                             proxy.native.height, give_up ? "nothing (given up)" : source,
                             hd_temporal ? "" : (pass_now ? ", single DLSS" : ", single (no pass)"),
@@ -5396,8 +5462,9 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
                             w(temporal.motion), h(temporal.motion), w(temporal.raw_display),
                             h(temporal.raw_display),
                             temporal.raw_frame == ~u64{0} ? 0 : temporal.raw_frame,
-                            HdUiMenuTdlss(), proxy.native_dirty, temporal.hd_menu_temporal,
-                            temporal.hd_menu_fallbacks);
+                            HdUiMenuTdlssLevel(), proxy.native_dirty, temporal.hd_menu_temporal,
+                            temporal.hd_menu_fallbacks, temporal.hd_late_restarts,
+                            temporal.hd_late_missed);
             }
             if (give_up) {
                 // No rejoin this frame, and the interface is shifted by the jitter as with
@@ -10197,6 +10264,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     // result too.
     std::optional<RenderState> raw_scene_state;
     std::optional<RenderState> kept_result_state;
+    // pr-tests HDUI late scene: the first draw into a display after this frame's anti-aliasing
+    // pass is the scene's composite (PrepareUiTarget).
+    temporal.composite_now = false;
+    if (temporal.taa_pass_frame == frame && temporal.composite_frame != frame &&
+        targets.colors[0] && IsDisplayAddress(targets.colors[0]->info.guest_address)) {
+        temporal.composite_frame = frame;
+        temporal.composite_now = true;
+    }
     if (temporal.pending_out) {
         const bool to_display =
             targets.colors[0] && IsDisplayAddress(targets.colors[0]->info.guest_address);
@@ -11234,6 +11309,7 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
     if (!fs || fs->pgm_hash != Gt7TemporalAa) {
         return;
     }
+    temporal.taa_pass_frame = frame; // pr-tests HDUI late scene: the composite is the next display draw
     // Set again below once the result's replacement is scheduled: a pass left to the game must
     // not inherit the last frame's way.
     temporal.mirror = false;
@@ -11359,9 +11435,9 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
             ++temporal.hd_trace_samples;
             temporal.hd_trace_frame = frame;
             temporal.hd_trace_draws = 0;
-            LOG_WARNING(Render_Vulkan, "HDUI-TRACE: frame {}: {} (temporal out {:#x})", frame,
+            LOG_WARNING(Render_Vulkan, "HDUI-TRACE: frame {}: {} (pass result {:#x})", frame,
                         hd_race ? "race" : "3D menu",
-                        temporal.pending_out ? temporal.pending_out->info.guest_address : 0);
+                        targets.colors[1] ? targets.colors[1]->info.guest_address : 0);
         }
     }
     const bool left = menu_classic && hud_mode == 0 && !menus_too &&

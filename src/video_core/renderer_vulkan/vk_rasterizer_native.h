@@ -411,6 +411,16 @@ private:
         u64 hd_src_logged_frame = 0;  ///< the last periodic HDUI-SRC line
         u64 hd_menu_fallbacks = 0;    ///< menu frames that fell back
         u64 hd_menu_temporal = 0;     ///< menu frames whose proxy took temporal DLSS
+        /// pr-tests HDUI late scene (RYGT_HD_UI_LATE_SCENE=1, or RYGT_HD_UI_MENU_TDLSS=1/2): the
+        /// frame GT7's anti-aliasing pass last ran in, the frame its composite (the first draw
+        /// into a display after it) was seen in, and whether the current draw is that composite.
+        u64 taa_pass_frame = ~u64{0};
+        u64 composite_frame = ~u64{0};
+        bool composite_now = false;
+        u64 hd_late_restarts = 0;     ///< composites that found the proxy already scaled
+        u64 hd_late_missed = 0;       ///< of those, frames the restart was off for
+        u32 hd_late_logs = 0;
+        u32 hd_depth_giveups = 0;     ///< =2: proxy given up for a depth draw (logged)
         u64 scene_draw_frame = ~u64{0}; ///< the frame the first draw into a display was seen in
         bool through = false;         ///< logged
         u32 through_changes = 0;      ///< logged
