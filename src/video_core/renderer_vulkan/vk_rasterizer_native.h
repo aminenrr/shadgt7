@@ -405,6 +405,12 @@ private:
         u64 hd_trace_frame = ~u64{0}; ///< pr-tests: the frame whose display draws are logged
         u32 hd_trace_draws = 0;
         u32 hd_trace_samples = 0;
+        /// pr-tests HDUI+TDLSS (RYGT_HD_UI_MENU_TDLSS=1): after a menu frame whose HD UI proxy
+        /// could not take temporal DLSS, menus keep the game's resolved picture until this frame.
+        u64 hd_menu_hold_until = 0;
+        u64 hd_src_logged_frame = 0;  ///< the last periodic HDUI-SRC line
+        u64 hd_menu_fallbacks = 0;    ///< menu frames that fell back
+        u64 hd_menu_temporal = 0;     ///< menu frames whose proxy took temporal DLSS
         u64 scene_draw_frame = ~u64{0}; ///< the frame the first draw into a display was seen in
         bool through = false;         ///< logged
         u32 through_changes = 0;      ///< logged

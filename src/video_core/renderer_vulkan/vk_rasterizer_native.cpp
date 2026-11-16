@@ -889,6 +889,18 @@ static vk::Extent2D ShownPart(const Native::ImageEntry& picture) {
     return size;
 }
 
+// pr-tests HDUI+TDLSS (RYGT_HD_UI_MENU_TDLSS=1, off by default): with GPU.hd_ui, menus with a
+// 3D scene take temporal DLSS again; the HD UI proxy gets the frame's depth, motion and jitter
+// (the picture drawn beside in a mirror frame). Where it cannot, the menu falls back to the
+// game's resolved picture (RYGT_HD_UI_MENU_TEMPORAL off, 57200074) for a second.
+static bool HdUiMenuTdlss() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_HD_UI_MENU_TDLSS");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
 bool NativeRenderer::HudSplitOn() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_HUD_SPLIT");
@@ -5250,14 +5262,18 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
             // pr-tests HDUI+TDLSS: in a race frame whose temporal pass was replaced with the
             // un-resolved colour (DLSS-GT7-001), DLSS gets that frame's depth, motion vectors
             // and jitter here, as the presenter's pass would; the UI is drawn after, at the
-            // output size. Menus ("mirror" frames) and anything that does not fit stay single.
-            std::optional<RytyUpscale::TemporalInputs> hd_temporal;
-            if (RytyUpscale::TemporalActive() && temporal.frame == frame &&
-                temporal.replaced_frame == frame && !temporal.mirror && temporal.depth &&
-                temporal.motion && temporal.depth->info.size.width == proxy.native.width &&
-                temporal.depth->info.size.height == proxy.native.height &&
-                temporal.motion->info.size.width == proxy.native.width &&
-                temporal.motion->info.size.height == proxy.native.height) {
+            // output size. Menus ("mirror" frames) and anything that does not fit stay single,
+            // unless RYGT_HD_UI_MENU_TDLSS=1 (below).
+            const bool hd_race =
+                temporal.hd_race_frame != ~u64{0} && frame - temporal.hd_race_frame <= 2;
+            const bool pass_now = RytyUpscale::TemporalActive() && temporal.frame == frame;
+            const bool menu_tdlss = HdUiMenuTdlss() && !hd_race && pass_now &&
+                                    !proxy.native_dirty && frame >= temporal.hd_menu_hold_until;
+            const auto fits = [&](const Native::ImageEntry* image) {
+                return image && image->info.size.width == proxy.native.width &&
+                       image->info.size.height == proxy.native.height;
+            };
+            const auto take_inputs = [&]() -> std::optional<RytyUpscale::TemporalInputs> {
                 VideoCore::ImageViewInfo depth_info{};
                 depth_info.format = vk::Format::eR32Sfloat;
                 VideoCore::ImageViewInfo motion_info{};
@@ -5277,9 +5293,118 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
                 inputs.mvec_scale[0] = temporal.mvec_scale[0];
                 inputs.mvec_scale[1] = temporal.mvec_scale[1];
                 inputs.reset = temporal.reset;
-                if (inputs.depth_view && inputs.motion_view) {
-                    hd_temporal = inputs;
+                if (!inputs.depth_view || !inputs.motion_view) {
+                    return std::nullopt;
                 }
+                return inputs;
+            };
+            std::optional<RytyUpscale::TemporalInputs> hd_temporal;
+            vk::Image source_image{Handle<VkImage_T>(entry->image->NativeHandle())};
+            vk::ImageView source_view = view;
+            const char* source = "game display";
+            // RYGT_HD_UI_MENU_TDLSS: why this menu frame falls back, and whether the display
+            // holds the un-resolved colour (the proxy is then given up for the frame: DLSS takes
+            // the whole display, as with GPU.hd_ui off).
+            const char* fallback = nullptr;
+            bool give_up = false;
+            if (pass_now && temporal.replaced_frame == frame && !temporal.mirror &&
+                fits(temporal.depth) && fits(temporal.motion)) {
+                hd_temporal = take_inputs();
+                if (hd_temporal) {
+                    source = "game display, un-resolved, with temporal inputs";
+                } else if (menu_tdlss) {
+                    fallback = "no view of the depth or motion vectors";
+                    give_up = true;
+                }
+            } else if (menu_tdlss && temporal.mirror) {
+                // A mirror frame: the game's display holds its resolved picture; the tone-mapped
+                // un-resolved scene was drawn beside it (raw_display) at the tone mapping.
+                if (temporal.raw_frame != frame) {
+                    fallback = "mirror frame: nothing drawn beside yet";
+                } else if (temporal.raw_address != entry->info.guest_address) {
+                    fallback = "mirror frame: the picture beside is another display's";
+                } else if (!fits(temporal.raw_display)) {
+                    fallback = "mirror frame: the picture beside is not the proxy's size";
+                } else if (!fits(temporal.depth) || !fits(temporal.motion)) {
+                    fallback = "mirror frame: depth or motion vectors not the proxy's size";
+                } else {
+                    const vk::ImageView raw =
+                        View(*temporal.raw_display, view_info, ViewUse::Sampled);
+                    if (raw) {
+                        hd_temporal = take_inputs();
+                    }
+                    if (hd_temporal) {
+                        source_image = vk::Image{
+                            Handle<VkImage_T>(temporal.raw_display->image->NativeHandle())};
+                        source_view = raw;
+                        source = "mirror copy drawn beside, with temporal inputs";
+                    } else {
+                        fallback = "mirror frame: no view of the picture beside, depth or motion";
+                    }
+                }
+            } else if (menu_tdlss) {
+                if (temporal.replaced_frame != frame) {
+                    fallback = "the pass's result was not replaced this frame";
+                } else if (!temporal.depth || !temporal.motion) {
+                    fallback = "no depth or motion vectors";
+                } else {
+                    fallback = "depth or motion vectors not the proxy's size";
+                }
+                give_up = temporal.replaced_frame == frame;
+            }
+            if (menu_tdlss) {
+                if (hd_temporal) {
+                    ++temporal.hd_menu_temporal;
+                } else {
+                    ++temporal.hd_menu_fallbacks;
+                    temporal.hd_menu_hold_until = frame + 60;
+                    LOG_WARNING(Render_Vulkan,
+                                "HDUI-SRC: frame {}: menu falls back: {}; {}, then the game's "
+                                "resolved picture for 60 frames ({} fallbacks, {} menu frames "
+                                "with temporal DLSS so far)",
+                                frame, fallback ? fallback : "?",
+                                give_up ? "DLSS takes the whole display this frame (no proxy)"
+                                        : "the proxy scales the game's resolved picture",
+                                temporal.hd_menu_fallbacks, temporal.hd_menu_temporal);
+                }
+            }
+            // pr-tests (diagnosis): every 600 frames, the picture the proxy takes and why.
+            if (frame >= temporal.hd_src_logged_frame + 600) {
+                temporal.hd_src_logged_frame = frame;
+                const bool race_hud = temporal.race_hud_frame != ~u64{0} &&
+                                      frame - temporal.race_hud_frame <= 2;
+                const bool read_back = temporal.display_read_frame != ~u64{0} &&
+                                       frame - temporal.display_read_frame <= 30;
+                const auto w = [](const Native::ImageEntry* image) {
+                    return image ? image->info.size.width : 0u;
+                };
+                const auto h = [](const Native::ImageEntry* image) {
+                    return image ? image->info.size.height : 0u;
+                };
+                LOG_WARNING(Render_Vulkan,
+                            "HDUI-SRC: frame {}: proxy {:#x} {}x{} takes the {}{}: pass {}, "
+                            "replaced {}, mirror {}, through {}, left {}, race HUD {}, read-back "
+                            "{}, HD race {}, depth {}x{}, motion {}x{}, beside {}x{} (frame {}), "
+                            "switch {}, native dirty {} ({} menu frames temporal, {} fell back)",
+                            frame, entry->info.guest_address, proxy.native.width,
+                            proxy.native.height, give_up ? "nothing (given up)" : source,
+                            hd_temporal ? "" : (pass_now ? ", single DLSS" : ", single (no pass)"),
+                            temporal.frame == ~u64{0} ? 0 : temporal.frame,
+                            temporal.replaced_frame == ~u64{0} ? 0 : temporal.replaced_frame,
+                            temporal.mirror, temporal.through_frame == frame, temporal.left,
+                            race_hud, read_back, hd_race, w(temporal.depth), h(temporal.depth),
+                            w(temporal.motion), h(temporal.motion), w(temporal.raw_display),
+                            h(temporal.raw_display),
+                            temporal.raw_frame == ~u64{0} ? 0 : temporal.raw_frame,
+                            HdUiMenuTdlss(), proxy.native_dirty, temporal.hd_menu_temporal,
+                            temporal.hd_menu_fallbacks);
+            }
+            if (give_up) {
+                // No rejoin this frame, and the interface is shifted by the jitter as with
+                // GPU.hd_ui off (Draw); the presenter's temporal DLSS takes the display.
+                temporal.hd_ui_scene_frame = frame;
+                proxy.phase = UiHires::Phase::Off;
+                return;
             }
             // pr-tests (diagnosis): why the HD UI proxy scales this frame without the temporal
             // inputs while temporal DLSS is on (it then runs DLSS on a single frame).
@@ -5298,9 +5423,8 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
                                 temporal.motion != nullptr);
                 }
             }
-            UiHires::UpscaleNative(r.instance, r.scheduler.DirectCommandBuffer(),
-                                   vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
-                                   view, view_info.format, proxy, !proxy.native_dirty,
+            UiHires::UpscaleNative(r.instance, r.scheduler.DirectCommandBuffer(), source_image,
+                                   source_view, view_info.format, proxy, !proxy.native_dirty,
                                    hd_temporal ? &*hd_temporal : nullptr);
         }
         // Allocate all auxiliary views before redirecting any attachment. Failed creation
@@ -11275,13 +11399,21 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
         }();
         const bool hd_race =
             temporal.hd_race_frame != ~u64{0} && frame - temporal.hd_race_frame <= 2;
-        const bool keep = UiHires::Enabled() && !menu_temporal && !hd_race;
+        // RYGT_HD_UI_MENU_TDLSS=1: menus take the pass too, unless one fell back just now.
+        const bool tdlss = HdUiMenuTdlss() && !menu_temporal;
+        const bool held = tdlss && frame < temporal.hd_menu_hold_until;
+        const bool keep = UiHires::Enabled() && !menu_temporal && !hd_race && (!tdlss || held);
         static bool keep_logged = false;
         static u32 keep_changes = 0;
         if (UiHires::Enabled() && keep != keep_logged && keep_changes++ < 64) {
             LOG_WARNING(Render_Vulkan, "HDUI-MENU: frame {}: {}", frame,
-                        keep ? "outside a race: the game's resolved picture is kept (no temporal)"
-                             : "a race: temporal DLSS");
+                        keep ? (held ? "a menu fell back: the game's resolved picture is kept "
+                                       "for now (RYGT_HD_UI_MENU_TDLSS)"
+                                     : "outside a race: the game's resolved picture is kept "
+                                       "(no temporal)")
+                        : hd_race ? "a race: temporal DLSS"
+                                  : "a menu: temporal DLSS into the HD UI proxy "
+                                    "(RYGT_HD_UI_MENU_TDLSS)");
         }
         keep_logged = keep;
         if (keep) {
