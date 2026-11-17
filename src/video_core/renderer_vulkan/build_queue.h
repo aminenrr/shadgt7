@@ -23,6 +23,19 @@ inline std::atomic<u32> g_build_jobs{0};
 /// cores at its usual width, and background compiles that read it pause.
 inline std::atomic<bool> g_game_in_play{false};
 
+/// PRT-SPLASH (pr-tests): progress of the start-up shader work, for the splash screen's overlay
+/// (RYGT_SPLASH_SHADER_PROGRESS=1). The manifest pre-translation (PERF-GT7-117) counts its records,
+/// the pipeline prewarm (PRT-PREWARM, RYGT_PIPELINE_PREWARM=1) its recorded pipelines. Totals are 0
+/// until the work knows them; `running` is set before its thread starts and cleared when it ends.
+namespace BootProgress {
+inline std::atomic<bool> translate_running{false};
+inline std::atomic<u32> translate_total{0};
+inline std::atomic<u32> translate_done{0};
+inline std::atomic<bool> prewarm_running{false};
+inline std::atomic<u32> prewarm_total{0};
+inline std::atomic<u32> prewarm_done{0};
+} // namespace BootProgress
+
 /// The pipeline build workers' jobs (PERF-019). Urgent jobs (a draw waits) run first, the last
 /// one first; then FIX-GT7-009's screen ones (draws skipped again: each builds the one on screen
 /// skipped most) in order; then PERF-GT7-025's soon ones (draws that went on without their

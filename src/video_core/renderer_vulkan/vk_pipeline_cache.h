@@ -696,6 +696,41 @@ private:
     static constexpr size_t MaxPrefetchedModules = 1024;
     u64 prefetched_evicted = 0; ///< under prefetched_mutex
 
+    /// PRT-PREWARM (pr-tests, RYGT_PIPELINE_PREWARM=1, off by default): each pipeline the game
+    /// builds is recorded in the shader store (its key alone: its stages are stored translations).
+    /// At the next start, once the manifest pre-translation is done, the recorded pipelines are
+    /// built on low-priority threads (paused in races) from the stored translations, and a draw
+    /// whose key is one of them takes it instead of building it (no skipped draws, no pop-in).
+    struct PrewarmStage {
+        std::unique_ptr<Shader::Info> info;
+        Shader::RuntimeInfo runtime_info{};
+        std::optional<Shader::Gcn::FetchShaderData> fetch;
+        vk::ShaderModule module{};
+        bool ok = false;
+    };
+    void PrewarmPipelines(std::stop_token stop);
+    /// The stage of a stored permutation (HashCombine(program, index)); null when it can't be
+    /// built from the store as a draw would use it.
+    const PrewarmStage* GetPrewarmStage(u64 perm_hash);
+    /// A new pipeline was installed for the current key: recorded once.
+    void NotePipelineInstalled();
+    /// A prewarmed pipeline for the key, taken out (null when none).
+    std::unique_ptr<GraphicsPipeline> TakePrewarmed(const GraphicsPipelineKey& key);
+    bool PrewarmReady(const GraphicsPipelineKey& key);
+    /// A stored permutation's module made by the prewarm, handed to the program that loads it.
+    vk::ShaderModule TakePrewarmModule(u64 perm_hash);
+    std::mutex prewarm_mutex;
+    std::unordered_map<u64, std::unique_ptr<PrewarmStage>> prewarm_stages; ///< by permutation hash
+    /// Modules not taken by a program yet (destroyed at exit), by permutation hash.
+    std::unordered_map<u64, vk::ShaderModule> prewarm_modules;
+    std::unordered_set<u64> prewarm_seen;     ///< keys (hashed) the game built or took
+    std::unordered_set<u64> prewarm_recorded; ///< keys (hashed) already in the store
+    std::unordered_map<u64, size_t> prewarm_else_fixed; ///< FIX-018 boundaries at start
+    tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> prewarm_ready;
+    std::atomic<u32> prewarm_waiting{}; ///< size of prewarm_ready
+    std::atomic<u32> prewarm_installed{};
+    std::jthread prewarm_thread;
+
     // Last member, so the workers stop before anything they use is destroyed.
     std::unique_ptr<PipelineBuildWorkers> build_workers;
 };

@@ -1946,7 +1946,9 @@ void GraphicsPipeline::BuildDescSetLayout() {
         }
         const auto stage_bit = LogicalStageToStageBit[u32(stage->sw_stage)];
         for (const auto& buffer : stage->buffers) {
-            [[maybe_unused]] const auto sharp = buffer.GetSharp(*stage);
+            // PRT-PREWARM: a prewarm build has no draw to read the descriptor from.
+            [[maybe_unused]] const auto sharp =
+                t_prewarm_build ? AmdGpu::Buffer{} : buffer.GetSharp(*stage);
             bindings.push_back({
                 .binding = binding++,
                 .descriptorType = vk::DescriptorType::eStorageBuffer,

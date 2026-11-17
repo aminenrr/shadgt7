@@ -63,6 +63,7 @@ extern "C" void __llvm_profile_initialize_file();
 
 namespace Libraries::SystemService {
 void NoteGameDrew(); // ryty_stubs.cpp: the splash screen ends at the game's first drawn frame
+bool IsSplashVisible(); // ryty_stubs.cpp
 }
 namespace Vulkan {
 void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label); // ryty_write_watch.cpp
@@ -217,6 +218,107 @@ void DrawCompileNotice() {
     draw->AddText(at, IM_COL32(255, 255, 255, 235), text);
 }
 
+// PRT-SPLASH (pr-tests): RYGT_SPLASH_SHADER_PROGRESS=1 (off by default), with Show Splash on: while
+// the stored shaders are translated again (RYGT_MANIFEST_PRETRANSLATE, PERF-GT7-117) and the recorded
+// pipelines built (RYGT_PIPELINE_PREWARM, PRT-PREWARM) at start, a progress bar near the bottom of
+// the splash screen, in RyGT Sport's style (PERF-098): "Building shaders 12,345 / 25,226". Drawn by
+// the present thread from the workers' counters: nothing waits for it. Shown only when the work
+// started while the splash screen showed; it stays until the work is done (not in a race), then
+// "Shaders ready" fades out.
+bool SplashProgressOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_SPLASH_SHADER_PROGRESS");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+std::string WithThousands(u32 value) {
+    std::string digits = std::to_string(value);
+    for (int at = static_cast<int>(digits.size()) - 3; at > 0; at -= 3) {
+        digits.insert(static_cast<size_t>(at), ",");
+    }
+    return digits;
+}
+
+void DrawBootShaderProgress() {
+    if (!SplashProgressOn() || !EmulatorSettings.IsShowSplash()) {
+        return;
+    }
+    namespace Progress = Vulkan::BootProgress;
+    using Clock = std::chrono::steady_clock;
+    static bool armed = false;
+    static Clock::time_point finished{};
+    const bool translating = Progress::translate_running.load(std::memory_order_acquire);
+    const bool prewarming = Progress::prewarm_running.load(std::memory_order_acquire);
+    const bool running = translating || prewarming;
+    if (!armed) {
+        if (!running || !Libraries::SystemService::IsSplashVisible()) {
+            return;
+        }
+        armed = true;
+    }
+    float alpha = 1.0f;
+    if (running) {
+        finished = {};
+    } else {
+        if (finished == Clock::time_point{}) {
+            finished = Clock::now();
+        }
+        const float since = std::chrono::duration<float>(Clock::now() - finished).count();
+        alpha = std::clamp(1.0f - (since - 1.5f) / 0.5f, 0.0f, 1.0f);
+        if (alpha <= 0.0f) {
+            return;
+        }
+    }
+    if (Vulkan::g_game_in_play.load(std::memory_order_relaxed)) {
+        return; // a race: the prewarm pauses there too
+    }
+    u32 done = 0;
+    u32 total = 0;
+    const char* what = "Building shaders";
+    if (translating) {
+        done = Progress::translate_done.load(std::memory_order_relaxed);
+        total = Progress::translate_total.load(std::memory_order_relaxed);
+    } else if (prewarming) {
+        what = "Building pipelines";
+        done = Progress::prewarm_done.load(std::memory_order_relaxed);
+        total = Progress::prewarm_total.load(std::memory_order_relaxed);
+    }
+    done = std::min(done, total);
+    const float fraction = running ? (total ? float(done) / float(total) : 0.0f) : 1.0f;
+    char text[128];
+    if (!running) {
+        std::snprintf(text, sizeof(text), "Shaders ready");
+    } else if (total == 0) {
+        std::snprintf(text, sizeof(text), "%s...", what);
+    } else {
+        std::snprintf(text, sizeof(text), "%s   %s / %s   %.0f%%", what,
+                      WithThousands(done).c_str(), WithThousands(total).c_str(),
+                      fraction * 100.0f);
+    }
+    const auto a = [alpha](float value) { return static_cast<int>(value * alpha); };
+    auto* draw = ImGui::GetForegroundDrawList();
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float width = std::clamp(viewport->Size.x * 0.36f, 240.0f, 720.0f);
+    const float bar_height = 6.0f;
+    const ImVec2 bar_min{viewport->Pos.x + (viewport->Size.x - width) * 0.5f,
+                         viewport->Pos.y + viewport->Size.y * 0.90f};
+    const ImVec2 bar_max{bar_min.x + width, bar_min.y + bar_height};
+    draw->AddRectFilled(bar_min, bar_max, IM_COL32(25, 80, 190, a(70)), bar_height * 0.5f);
+    if (fraction > 0.0f) {
+        draw->AddRectFilled(bar_min, {bar_min.x + width * fraction, bar_max.y},
+                            IM_COL32(70, 150, 255, a(175)), bar_height * 0.5f);
+    }
+    const ImVec2 size = ImGui::CalcTextSize(text);
+    const ImVec2 at{bar_min.x + (width - size.x) * 0.5f, bar_min.y - size.y - 6.0f};
+    for (const ImVec2 offset : {ImVec2{-1, 0}, ImVec2{1, 0}, ImVec2{0, -1}, ImVec2{0, 1},
+                                ImVec2{1, 1}, ImVec2{2, 2}}) {
+        draw->AddText({at.x + offset.x, at.y + offset.y}, IM_COL32(0, 0, 0, a(150)), text);
+    }
+    draw->AddText(at, IM_COL32(255, 255, 255, a(235)), text);
+}
+
 // What the watermark says: this renderer's revision, after the prerelease's name when this is
 // that prerelease's renderer (manifest.json beside the exe has its commit; a test renderer copied
 // into a release leaves the release's manifest there). Empty in a tagged release, or with
@@ -263,6 +365,7 @@ void DrawWatermark() {
 // type in the window's top left corner, over the game and the splash screen.
 void DrawFpsCounter() {
     Ryty::DrawControllerOverlay();
+    DrawBootShaderProgress(); // PRT-SPLASH
     DrawCompileNotice();
     DrawWatermark();
     if (!EmulatorSettings.IsShowFpsCounter()) {

@@ -25,6 +25,10 @@ namespace Vulkan {
 /// build's shared libraries.
 inline thread_local bool g_pipeline_build_urgent = false;
 
+/// PRT-PREWARM (pr-tests): this thread builds a recorded pipeline at start, from the shader store
+/// alone: no draw, so its shaders' user data and buffer descriptors are not read.
+inline thread_local bool t_prewarm_build = false;
+
 static constexpr u32 MaxShaderStages = static_cast<u32>(Shader::SwStage::NumLogicalStages);
 static constexpr u32 MaxVertexBufferCount = 32;
 

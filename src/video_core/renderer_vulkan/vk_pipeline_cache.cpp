@@ -1527,6 +1527,12 @@ void PipelineCache::VerifyManifest(std::stop_token stop) {
 // their translations. A record is stored only when every guest read replays as recorded.
 void PipelineCache::PretranslateManifest(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:Pretranslate");
+    // PRT-SPLASH: set by the constructor before this thread starts, cleared however it ends.
+    struct TranslateDone {
+        ~TranslateDone() {
+            BootProgress::translate_running.store(false, std::memory_order_release);
+        }
+    } translate_done_guard;
     SleepUnlessStopped(stop, std::chrono::seconds{2});
     if (stop.stop_requested() || !use_stored_shaders || !Storage::DataBase::Instance().IsOpened()) {
         LOG_WARNING(Render_Vulkan, "PERF-GT7-117: no shader store, nothing pre-translated");
@@ -1538,6 +1544,8 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
         if (entry.path().extension() == ".rec") files.push_back(entry.path());
     }
     std::sort(files.begin(), files.end());
+    BootProgress::translate_done.store(0, std::memory_order_relaxed); // PRT-SPLASH
+    BootProgress::translate_total.store(static_cast<u32>(files.size()), std::memory_order_relaxed);
     const auto start_time = std::chrono::steady_clock::now();
     std::atomic<size_t> next{0};
     std::atomic<u32> stored{0}, already{0}, unreplayed{0}, failed{0}, no_code{0}, duplicate{0};
@@ -1552,6 +1560,7 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
         Shader::Pools pools;
         for (size_t i = next++; i < files.size() && !stop.stop_requested(); i = next++) {
+            BootProgress::translate_done.fetch_add(1, std::memory_order_relaxed); // PRT-SPLASH
             ManifestRecord r;
             if (!ReadManifestRecord(files[i], r) ||
                 Shader::SwStage(r.sw_stage) == Shader::SwStage::Geometry) {
@@ -1687,6 +1696,16 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count(),
                 count, stored.load(), already.load(), duplicate.load(), unreplayed.load(),
                 no_code.load(), failed.load(), in_use.load());
+}
+
+// PRT-PREWARM (pr-tests): RYGT_PIPELINE_PREWARM=1 records the game's pipelines and builds them
+// again at the next start (PipelineCache::PrewarmPipelines). Off by default.
+static bool PrewarmOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_PIPELINE_PREWARM");
+        return env && env[0] == '1';
+    }();
+    return on;
 }
 
 // PERF-GT7-037: GT7 uses the same few compute pipelines in every race, some of which take the
@@ -2311,6 +2330,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             Storage::DataBase::Instance().Open();
             use_stored_shaders = Storage::DataBase::Instance().IsOpened();
             if (pretranslate_wanted && use_stored_shaders) { // PERF-GT7-117
+                BootProgress::translate_running.store(true, std::memory_order_release); // PRT-SPLASH
                 pretranslate_thread =
                     std::jthread([this](std::stop_token stop) { PretranslateManifest(stop); });
             }
@@ -2341,6 +2361,19 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         }
     }
     LoadElseScopeFixed(); // after the store's Open: SHD-010's clear removes them with it
+    if (PrewarmOn()) { // PRT-PREWARM
+        if (use_stored_shaders) {
+            // FIX-018: what the store reads skip at this start (the map is the command
+            // thread's from here on).
+            for (const auto& [hash, program] : else_scope_fixed) {
+                prewarm_else_fixed[hash] = program.boundary;
+            }
+            BootProgress::prewarm_running.store(true, std::memory_order_release); // PRT-SPLASH
+            prewarm_thread = std::jthread([this](std::stop_token stop) { PrewarmPipelines(stop); });
+        } else {
+            LOG_WARNING(Render_Vulkan, "PRT-PREWARM: no shader store, no pipeline prewarm");
+        }
+    }
     if (CompileMode() == 1 && AsyncPipelines()) {
         static std::jthread slow_motion{SlowMotionThread}; // PERF-103
     }
@@ -2370,11 +2403,19 @@ PipelineCache::~PipelineCache() {
         warm_compute_thread.join();
     }
     // PERF-GT7-111/117: they read the cache's tables, the store and the device.
-    for (std::jthread* thread : {&pretranslate_thread, &verify_thread}) {
+    for (std::jthread* thread : {&prewarm_thread, &pretranslate_thread, &verify_thread}) {
         if (thread->joinable()) {
             thread->request_stop();
             thread->join();
         }
+    }
+    {
+        // PRT-PREWARM: the modules no program took; the prewarmed pipelines go with the members.
+        std::scoped_lock lk{prewarm_mutex};
+        for (const auto& [hash, module] : prewarm_modules) {
+            instance.GetDevice().destroyShaderModule(module);
+        }
+        prewarm_modules.clear();
     }
     if (liverpool) {
         liverpool->on_command_buffer_start = nullptr;
@@ -3015,8 +3056,8 @@ void PipelineCache::ReadAhead(const DrawIndirectParams params, bool restore) {
         if (!valid || !HasSupportedColorTargets() || graphics_pipelines.contains(S().graphics_key)) {
             return false;
         }
-        if (pending_builds.contains(S().graphics_key)) {
-            return false;
+        if (pending_builds.contains(S().graphics_key) || PrewarmReady(S().graphics_key)) {
+            return false; // PRT-PREWARM: a prewarmed one is taken by its draw
         }
         pending_builds.emplace(S().graphics_key, StartPipelineBuild(false));
         ++started;
@@ -3137,7 +3178,8 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
             return !read_ahead_blocked;
         }
         if (!HasSupportedColorTargets() || graphics_pipelines.contains(S().graphics_key) ||
-            pending_builds.contains(S().graphics_key)) {
+            pending_builds.contains(S().graphics_key) ||
+            PrewarmReady(S().graphics_key)) { // PRT-PREWARM
             return true;
         }
         pending_builds.emplace(S().graphics_key, StartPipelineBuild(false));
@@ -3498,6 +3540,20 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         }
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(S().graphics_key);
+    if (is_new && prewarm_waiting.load(std::memory_order_relaxed) != 0 &&
+        !pending_builds.contains(S().graphics_key)) {
+        // PRT-PREWARM: built at start from the recorded pipelines.
+        if (auto prewarmed = TakePrewarmed(S().graphics_key)) {
+            prewarmed->SetStageInfos(S().infos);
+            it.value() = std::move(prewarmed);
+            const u32 installed = prewarm_installed.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (installed == 1 || installed % 250 == 0) {
+                LOG_WARNING(Render_Vulkan, "PRT-PREWARM: {} prewarmed pipelines taken by draws",
+                            installed);
+            }
+            return it->second.get();
+        }
+    }
     if (is_new) {
         Common::GuestClock::CompilePause hold; // FIX-044
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(S().graphics_key);
@@ -3616,6 +3672,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 sdata = stored->sdata;
                 it.value() = std::move(stored->pipeline);
                 ++async_stats.installed;
+                NotePipelineInstalled(); // PRT-PREWARM
                 return it->second.get();
             }
             if (!force_wait && !LegacyWaits() && !WritesMemory(S().infos) &&
@@ -3744,6 +3801,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         }
         ++num_new_pipelines;
         MaybeSaveDriverCache();
+        NotePipelineInstalled(); // PRT-PREWARM
 
         if (EmulatorSettings.IsShaderCollect()) {
             for (auto stage = 0; stage < MaxShaderStages; ++stage) {
@@ -4955,6 +5013,12 @@ vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx,
     static u64 loaded = 0;
     static u64 prefetched = 0;
     if (&store == &Storage::DataBase::Instance()) {
+        // PRT-PREWARM: made by the pipeline prewarm already (its pipelines use this module).
+        if (const auto module = TakePrewarmModule(HashCombine(pgm_hash, u64{perm_idx}))) {
+            return module;
+        }
+    }
+    if (&store == &Storage::DataBase::Instance()) {
         // PERF-GT7-118: made by a store reader already.
         std::scoped_lock lk{prefetched_mutex};
         if (const auto it = prefetched_modules.find(HashCombine(pgm_hash, u64{perm_idx}));
@@ -5012,6 +5076,395 @@ vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx,
                     loaded);
     }
     return CompileSPV(spv, instance.GetDevice(), instance.IsShaderObjectEnabled());
+}
+
+// PRT-PREWARM (pr-tests): the pipeline prewarm. RYGT_PIPELINE_PREWARM=1 (off by default).
+// Lance removed the old precompile (WarmUp, PERF-024) in da66c3a8e3; this re-ports its idea to
+// today's cache. While playing, each new pipeline's key is kept in the shader store (a .key file:
+// its stages are the store's translations, by permutation hash). At the next start, once the
+// manifest pre-translation (PERF-GT7-117) is done, the recorded pipelines are built on
+// low-priority threads, paused while the game is in play, from the stored translations; a draw
+// whose key is one of them takes it (PipelineForCurrentKey) instead of skipping until a worker
+// builds it. Their modules are handed to the programs that load the same translations
+// (LoadStoredModule), so draws and prewarmed pipelines share them and their libraries.
+// Only what can be built exactly as a draw would be: no geometry stage, no image whose bindings
+// count the T#'s mip levels, translations the store still has and a draw would load (the checks
+// of LoadStoredModule), on a GPU with dynamic vertex input (the vertex layout is otherwise read
+// from the draw's buffers), without shader objects or shader patches.
+namespace {
+constexpr u32 PrewarmRecordMagic = 0x57505247; // "GRPW"
+constexpr u32 PrewarmRecordVersion = 1;
+
+std::string PrewarmRecordName(u64 key_hash) {
+    return fmt::format("prewarm-{:016x}", key_hash);
+}
+
+bool PrewarmColorTargetsSupported(const GraphicsPipelineKey& key) {
+    if (key.num_color_attachments > AmdGpu::NUM_COLOR_BUFFERS) {
+        return false;
+    }
+    for (u32 cb = 0; cb < key.num_color_attachments; ++cb) {
+        const auto& color_buffer = key.color_buffers[cb];
+        if (color_buffer.data_format != AmdGpu::DataFormat::FormatInvalid &&
+            Vulkan::LiverpoolToVK::TrySurfaceFormat(color_buffer.data_format,
+                                                    color_buffer.num_format) ==
+                vk::Format::eUndefined) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool CountsMipLevels(const Shader::Info& info) {
+    return std::ranges::any_of(info.images, [](const auto& image) {
+        return image.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex;
+    });
+}
+} // namespace
+
+bool PipelineCache::PrewarmReady(const GraphicsPipelineKey& key) {
+    if (prewarm_waiting.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    std::scoped_lock lk{prewarm_mutex};
+    return prewarm_ready.contains(key);
+}
+
+std::unique_ptr<GraphicsPipeline> PipelineCache::TakePrewarmed(const GraphicsPipelineKey& key) {
+    std::scoped_lock lk{prewarm_mutex};
+    // Not built at start any more, whether or not it was: the game has it from here.
+    prewarm_seen.insert(std::hash<GraphicsPipelineKey>{}(key));
+    const auto it = prewarm_ready.find(key);
+    if (it == prewarm_ready.end()) {
+        return nullptr;
+    }
+    auto pipeline = std::move(it.value());
+    prewarm_ready.erase(it);
+    prewarm_waiting.fetch_sub(1, std::memory_order_relaxed);
+    return pipeline;
+}
+
+vk::ShaderModule PipelineCache::TakePrewarmModule(u64 perm_hash) {
+    if (!PrewarmOn()) {
+        return {};
+    }
+    std::scoped_lock lk{prewarm_mutex};
+    const auto it = prewarm_modules.find(perm_hash);
+    if (it == prewarm_modules.end()) {
+        return {};
+    }
+    const auto module = it->second;
+    prewarm_modules.erase(it); // the program owns it from here
+    return module;
+}
+
+void PipelineCache::NotePipelineInstalled() {
+    if (!PrewarmOn() || S().key_uses_legacy) {
+        return;
+    }
+    const auto& key = S().graphics_key;
+    const u64 hash = std::hash<GraphicsPipelineKey>{}(key);
+    {
+        std::scoped_lock lk{prewarm_mutex};
+        prewarm_seen.insert(hash);
+        if (!prewarm_recorded.insert(hash).second) {
+            return;
+        }
+    }
+    if (key.stage_hashes[u32(Shader::SwStage::Geometry)] != 0 ||
+        key.stage_hashes[u32(Shader::SwStage::Vertex)] == 0 ||
+        !Storage::DataBase::Instance().IsOpened()) {
+        return;
+    }
+    for (const auto* info : S().infos) {
+        if (info && CountsMipLevels(*info)) {
+            return;
+        }
+    }
+    const std::array<u32, 3> header{PrewarmRecordMagic, PrewarmRecordVersion,
+                                    static_cast<u32>(sizeof(GraphicsPipelineKey))};
+    std::vector<u8> data(sizeof(header) + sizeof(GraphicsPipelineKey));
+    std::memcpy(data.data(), header.data(), sizeof(header));
+    std::memcpy(data.data() + sizeof(header), &key, sizeof(key));
+    Storage::DataBase::Instance().Save(Storage::BlobType::PipelineKey, PrewarmRecordName(hash),
+                                       std::move(data));
+}
+
+const PipelineCache::PrewarmStage* PipelineCache::GetPrewarmStage(u64 perm_hash) {
+    {
+        std::scoped_lock lk{prewarm_mutex};
+        if (const auto it = prewarm_stages.find(perm_hash); it != prewarm_stages.end()) {
+            return it->second->ok ? it->second.get() : nullptr;
+        }
+    }
+    // Made outside the lock (several threads may make the same one: the first one kept wins).
+    auto stage = std::make_unique<PrewarmStage>();
+    const auto make = [&] {
+        auto& store = Storage::DataBase::Instance();
+        const auto meta_name = fmt::format("{:#018x}", perm_hash);
+        if (!store.Exists(Storage::BlobType::ShaderMeta, meta_name)) {
+            return;
+        }
+        std::vector<u8> meta;
+        store.Load(Storage::BlobType::ShaderMeta, meta_name, meta);
+        if (meta.size() < 24) {
+            return;
+        }
+        auto info = std::make_unique<Shader::Info>();
+        Shader::StageSpecialization spec{};
+        spec.info = info.get();
+        size_t perm_idx{};
+        Serialization::Archive ar{std::move(meta)};
+        bool valid = false;
+        try {
+            Common::RecoverableScope recoverable;
+            valid = LoadShaderMeta(ar, *info, spec, perm_idx);
+        } catch (const Common::RecoverableFailure&) {
+            valid = false;
+        }
+        if (!valid || HashCombine(info->pgm_hash, u64{perm_idx}) != perm_hash) {
+            return;
+        }
+        // FIX-018/020: translated before a translator fix (a draw translates it again).
+        if (const auto fixed = prewarm_else_fixed.find(info->pgm_hash);
+            fixed != prewarm_else_fixed.end() && perm_idx < fixed->second) {
+            return;
+        }
+        if (!info->attribute_flags_known || info->sw_stage == Shader::SwStage::Geometry ||
+            CountsMipLevels(*info)) {
+            return;
+        }
+        // D10: as ApplyStoredListing reads it.
+        info->uses_direct = std::ranges::any_of(info->buffers, [](const auto& buffer) {
+            return buffer.buffer_type == Shader::BufferType::DirectTable;
+        });
+        std::vector<u32> spv;
+        store.Load(Storage::BlobType::ShaderBinary,
+                   fmt::format("{:#018x}_{}", info->pgm_hash, perm_idx), spv);
+        // LoadStoredModule's checks: a draw would translate these again.
+        if (!IsCompleteSpirv(spv) || (Common::HdUiRequested() && NeedsNativeFragCoordScale(spv))) {
+            return;
+        }
+        if (const auto emulation = FindFloatAtomicEmulation(spv);
+            emulation != FloatAtomicEmulation::None &&
+            emulation != (Shader::Backend::SPIRV::FloatAtomicExact()
+                              ? FloatAtomicEmulation::OneAtomic
+                              : FloatAtomicEmulation::BothAtomics)) {
+            return;
+        }
+        stage->module = CompileSPV(spv, instance.GetDevice(), instance.IsShaderObjectEnabled());
+        if (!stage->module) {
+            return;
+        }
+        stage->runtime_info = spec.runtime_info;
+        if (!spec.fetch_shader_data.Empty()) {
+            stage->fetch = spec.fetch_shader_data;
+        }
+        stage->info = std::move(info);
+        stage->ok = true;
+    };
+    make();
+    vk::ShaderModule unused{};
+    const PrewarmStage* result = nullptr;
+    {
+        std::scoped_lock lk{prewarm_mutex};
+        const auto it = prewarm_stages.find(perm_hash);
+        if (it != prewarm_stages.end()) {
+            unused = stage->module; // another thread made it first
+            result = it->second->ok ? it->second.get() : nullptr;
+        } else {
+            const auto module = stage->module;
+            const bool ok = stage->ok;
+            auto& kept = prewarm_stages[perm_hash];
+            kept = std::move(stage);
+            if (ok) {
+                prewarm_modules.emplace(perm_hash, module);
+                result = kept.get();
+            }
+        }
+    }
+    if (unused) {
+        instance.GetDevice().destroyShaderModule(unused);
+    }
+    return result;
+}
+
+void PipelineCache::PrewarmPipelines(std::stop_token stop) {
+    Common::SetCurrentThreadName("shadGT:Prewarm");
+    // PRT-SPLASH: set by the constructor before this thread starts, cleared however it ends.
+    struct PrewarmDone {
+        ~PrewarmDone() {
+            BootProgress::prewarm_running.store(false, std::memory_order_release);
+        }
+    } prewarm_done_guard;
+    SleepUnlessStopped(stop, std::chrono::seconds{2});
+    // The pre-translation stores translations the pipelines are built from: after it.
+    while (!stop.stop_requested() &&
+           BootProgress::translate_running.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    }
+    if (stop.stop_requested()) {
+        return;
+    }
+    const char* why_not = nullptr;
+    if (!Storage::DataBase::Instance().IsOpened()) {
+        why_not = "no shader store";
+    } else if (!instance.IsVertexInputDynamicState()) {
+        why_not = "the GPU has no dynamic vertex input (a draw's buffers give the vertex layout)";
+    } else if (instance.IsShaderObjectEnabled()) {
+        why_not = "shader objects are on (RYGT_SHADER_OBJECT=1)";
+    } else if (EmulatorSettings.IsPatchShaders()) {
+        why_not = "shader patches are on";
+    }
+    if (why_not) {
+        LOG_WARNING(Render_Vulkan, "PRT-PREWARM: no pipeline prewarm: {}", why_not);
+        return;
+    }
+    std::vector<GraphicsPipelineKey> keys;
+    u32 unreadable = 0;
+    try {
+        Storage::DataBase::Instance().ForEachBlob(
+            Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
+                std::array<u32, 3> header{};
+                if (data.size() != sizeof(header) + sizeof(GraphicsPipelineKey)) {
+                    ++unreadable;
+                    return;
+                }
+                std::memcpy(header.data(), data.data(), sizeof(header));
+                if (header[0] != PrewarmRecordMagic || header[1] != PrewarmRecordVersion ||
+                    header[2] != sizeof(GraphicsPipelineKey)) {
+                    ++unreadable;
+                    return;
+                }
+                GraphicsPipelineKey key{};
+                std::memcpy(static_cast<void*>(&key), data.data() + sizeof(header), sizeof(key));
+                keys.push_back(key);
+            });
+    } catch (const std::exception& e) {
+        LOG_WARNING(Render_Vulkan, "PRT-PREWARM: reading the recorded pipelines stopped: {}",
+                    e.what());
+    }
+    {
+        std::scoped_lock lk{prewarm_mutex};
+        for (const auto& key : keys) {
+            prewarm_recorded.insert(std::hash<GraphicsPipelineKey>{}(key));
+        }
+    }
+    BootProgress::prewarm_done.store(0, std::memory_order_relaxed);
+    BootProgress::prewarm_total.store(static_cast<u32>(keys.size()), std::memory_order_relaxed);
+    if (keys.empty()) {
+        LOG_WARNING(Render_Vulkan, "PRT-PREWARM: no recorded pipelines yet ({} unreadable); "
+                                   "the ones built while playing are prewarmed at the next start",
+                    unreadable);
+        return;
+    }
+    const auto start_time = std::chrono::steady_clock::now();
+    std::atomic<size_t> next{0};
+    std::atomic<u32> built{0}, game_first{0}, not_buildable{0}, failed{0};
+    const auto work = [&](u32 index) {
+        Common::SetCurrentThreadName(fmt::format("shadGT:Prewarm{}", index).c_str());
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+        for (size_t i = next++; i < keys.size() && !stop.stop_requested(); i = next++) {
+            // Paused while the game is in play (a race): the cores and the driver are its.
+            while (g_game_in_play.load(std::memory_order_relaxed) && !stop.stop_requested()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{100});
+            }
+            BootProgress::prewarm_done.fetch_add(1, std::memory_order_relaxed);
+            const auto& key = keys[i];
+            const u64 hash = std::hash<GraphicsPipelineKey>{}(key);
+            {
+                std::scoped_lock lk{prewarm_mutex};
+                if (prewarm_seen.contains(hash)) {
+                    ++game_first;
+                    continue;
+                }
+            }
+            if (!PrewarmColorTargetsSupported(key) ||
+                key.stage_hashes[u32(Shader::SwStage::Geometry)] != 0 ||
+                key.stage_hashes[u32(Shader::SwStage::Vertex)] == 0) {
+                ++not_buildable;
+                continue;
+            }
+            std::array<const Shader::Info*, MaxShaderStages> infos{};
+            std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+            std::array<vk::ShaderModule, MaxShaderStages> modules{};
+            const Shader::Gcn::FetchShaderData* fetch = nullptr;
+            bool usable = true;
+            for (u32 st = 0; st < MaxShaderStages; ++st) {
+                if (key.stage_hashes[st] == 0) {
+                    continue;
+                }
+                const PrewarmStage* stage = GetPrewarmStage(key.stage_hashes[st]);
+                if (!stage) {
+                    usable = false;
+                    break;
+                }
+                infos[st] = stage->info.get();
+                runtime_infos[st] = stage->runtime_info;
+                modules[st] = stage->module;
+                if (stage->fetch && (!fetch || st == u32(Shader::SwStage::Vertex))) {
+                    fetch = &*stage->fetch;
+                }
+            }
+            if (!usable) {
+                ++not_buildable;
+                continue;
+            }
+            std::unique_ptr<GraphicsPipeline> pipeline;
+            GraphicsPipeline::SerializationSupport sdata{};
+            t_prewarm_build = true;
+            try {
+                Common::RecoverableScope recoverable;
+                pipeline = std::make_unique<GraphicsPipeline>(
+                    instance, scheduler, desc_heap, profile, key, *pipeline_cache, infos,
+                    runtime_infos, fetch, modules, sdata);
+            } catch (const Common::RecoverableFailure&) {
+                pipeline.reset();
+            } catch (...) {
+                pipeline.reset();
+            }
+            t_prewarm_build = false;
+            if (!pipeline) {
+                ++failed;
+                continue;
+            }
+            bool kept = false;
+            {
+                std::scoped_lock lk{prewarm_mutex};
+                if (!prewarm_seen.contains(hash) && !prewarm_ready.contains(key)) {
+                    prewarm_ready.emplace(key, std::move(pipeline));
+                    prewarm_waiting.fetch_add(1, std::memory_order_relaxed);
+                    kept = true;
+                }
+            }
+            if (kept) {
+                ++built;
+            } else {
+                ++game_first; // the game built it meanwhile; this one goes (outside the lock)
+                pipeline.reset();
+            }
+        }
+    };
+    const u32 count = std::clamp<u32>(std::thread::hardware_concurrency() / 4, 1, 4);
+    std::vector<std::thread> threads;
+    for (u32 t = 0; t < count; ++t) {
+        threads.emplace_back(work, t);
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    // In the driver's cache too: the GPU thread's next MaybeSaveDriverCache writes it.
+    driver_cache_save_requested.store(true, std::memory_order_release);
+    LOG_WARNING(Render_Vulkan,
+                "PRT-PREWARM: {} recorded pipelines in {:.1f} s on {} threads: {} built, {} "
+                "skipped ({} built by the game first, {} not buildable from the store), {} "
+                "failed; {} records unreadable{}",
+                keys.size(),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time)
+                    .count(),
+                count, built.load(), game_first.load() + not_buildable.load(), game_first.load(),
+                not_buildable.load(), failed.load(), unreadable,
+                stop.stop_requested() ? " (stopped)" : "");
 }
 
 void PipelineCache::DumpFailedShader(std::span<const u32> code, u64 hash, Shader::HwStage stage) {
