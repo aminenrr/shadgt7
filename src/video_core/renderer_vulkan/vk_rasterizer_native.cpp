@@ -1420,9 +1420,26 @@ vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
     return sampler;
 }
 
+// PRT-SAMPLER (pr-tests, RYGT_SAMPLER_DEDUPE=0 turns it off): GT7 reached the device's 4000
+// samplers (3,180 FIX-GT7-002 errors in a 2026-11-17 run, NVIDIA), and past it every new state got
+// the last sampler made, whatever its filters and clamps. Now: levels of detail in quarter steps
+// from half the limit (was three quarters), the resolution bias in 1/16 steps and custom border
+// colours in 8-bit steps in the key, and at the limit the first sampler with the same filters,
+// clamps, compare and border type stands in.
+static bool SamplerDedupeOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_SAMPLER_DEDUPE");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
 vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
                                         AmdGpu::BorderColorBuffer border, bool is_depth,
                                         float resolution_bias) {
+    if (SamplerDedupeOn() && resolution_bias != 0.0f) {
+        resolution_bias = std::round(resolution_bias * 16.0f) / 16.0f; // PRT-SAMPLER
+    }
     const bool custom = sharp.border_color_type == AmdGpu::BorderColor::Custom;
     const u64 hash = XXH3_64bits(&sharp, sizeof(sharp)) ^
                      (u64(std::bit_cast<u32>(resolution_bias)) << 16) ^
@@ -1458,7 +1475,7 @@ vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
         }
     }
     const u32 limit = r.instance.GetMaxSamplerAllocationCount();
-    if (samplers.size() >= limit / 4 * 3) {
+    if (samplers.size() >= (SamplerDedupeOn() ? limit / 2 : limit / 4 * 3)) { // PRT-SAMPLER
         // Close to the limit: levels of detail in quarter steps.
         const auto quarter = [](float lod) { return std::round(lod * 4.0f) * 64.0f; };
         state.min_lod.Assign(u64(quarter(sharp.MinLod())));
@@ -1499,22 +1516,67 @@ vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
         std::array<float, 4> color;
         u64 depth;
     };
-    const Key key{state, custom_color, is_depth ? 1u : 0u};
+    std::array<float, 4> key_color = custom_color;
+    if (SamplerDedupeOn()) {
+        // PRT-SAMPLER: 8-bit steps; the sampler itself still gets its colour from `border`.
+        for (float& c : key_color) {
+            c = std::isfinite(c) ? std::round(c * 255.0f) / 255.0f : 0.0f;
+        }
+    }
+    const Key key{state, key_color, is_depth ? 1u : 0u};
     const u64 state_hash = XXH3_64bits(&key, sizeof(key));
+    // PRT-SAMPLER: the coarse state, without levels of detail and border colour.
+    AmdGpu::Sampler coarse_state = state;
+    coarse_state.min_lod.Assign(0);
+    coarse_state.max_lod.Assign(0);
+    coarse_state.lod_bias.Assign(0);
+    coarse_state.border_color_ptr.Assign(0);
+    const Key coarse_key{coarse_state, {}, is_depth ? 1u : 0u};
+    const u64 coarse_hash = XXH3_64bits(&coarse_key, sizeof(coarse_key));
     auto& slot = samplers[state_hash];
     if (!slot) {
         if (samplers.size() + 64 > limit && !samplers.empty()) {
-            // At the limit: the last sampler made stands in (logged), rather than a failure.
+            // At the limit: a sampler made before stands in (logged), rather than a failure.
+            // PRT-SAMPLER: one with the same filters and clamps when there is one.
+            vk::Sampler stand_in = last_sampler;
+            bool coarse_found = false;
+            if (SamplerDedupeOn()) {
+                if (const auto it = sampler_coarse.find(coarse_hash); it != sampler_coarse.end()) {
+                    stand_in = it->second;
+                    coarse_found = true;
+                }
+            }
             static std::atomic<u32> logged{};
             if (Sample(logged)) {
-                LOG_ERROR(Render_Vulkan, "FIX-GT7-002: {} samplers, the device's limit is {}",
-                          samplers.size(), limit);
+                LOG_ERROR(Render_Vulkan,
+                          "FIX-GT7-002: {} samplers, the device's limit is {}; PRT-SAMPLER: {} "
+                          "coarse states, stand-in {}",
+                          samplers.size(), limit, sampler_coarse.size(),
+                          coarse_found ? "with the same filters and clamps" : "the last made");
             }
             samplers.erase(state_hash);
-            return last_sampler;
+            if (coarse_found) {
+                // Remembered for this raw S#, so the next lookup skips the hashing above.
+                if (sampler_lookup.size() > (1u << 20)) {
+                    sampler_lookup.clear();
+                }
+                sampler_lookup.emplace(hash, stand_in);
+            }
+            return stand_in;
         }
         slot = std::make_unique<VideoCore::Sampler>(r.instance, state, border, is_depth);
         last_sampler = slot->Handle();
+        sampler_coarse.try_emplace(coarse_hash, slot->Handle());
+        // PRT-SAMPLER: once, at half the limit: how many coarse states the samplers cover.
+        static bool half_logged = false;
+        if (!half_logged && samplers.size() >= limit / 2) {
+            half_logged = true;
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-SAMPLER: {} samplers (device limit {}) for {} coarse states; levels "
+                        "of detail in quarter steps from now{}",
+                        samplers.size(), limit, sampler_coarse.size(),
+                        SamplerDedupeOn() ? "" : " (off: RYGT_SAMPLER_DEDUPE=0, at 3/4)");
+        }
     }
     if (sampler_lookup.size() > (1u << 20)) {
         sampler_lookup.clear();

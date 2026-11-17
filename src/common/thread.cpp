@@ -155,6 +155,19 @@ bool CompileCoresOn() {
     }();
     return on;
 }
+
+// PRT-ECORE (pr-tests, RYGT_ECORE_DRIVER_COMPILE=0 turns it off): on a hybrid CPU the driver's
+// compiler threads (nvgpucomp64.dll) are kept on the efficiency cores too, like our own build and
+// translate threads (PERF-097). Before, ConfineDriverCompileThreads only ran on CPUs with one kind
+// of core, so on a 12700H the driver's own threads took the performance cores the game, the
+// command processor and the recorder run on. Outside a race the usual widening still applies.
+static bool EcoreDriverCompileOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_ECORE_DRIVER_COMPILE");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
 const CoreClasses& GetCoreClasses() {
     static const CoreClasses classes = [] {
         CoreClasses result;
@@ -196,6 +209,16 @@ const CoreClasses& GetCoreClasses() {
         }
         LOG_INFO(Common, "PERF-088: {} CPU, {} fast logical processors",
                  result.hybrid ? "hybrid" : "uniform", result.fast_ids.size());
+        if (result.hybrid && EcoreDriverCompileOn() && result.slow_ids.size() >= 2 &&
+            !result.fast_ids.empty()) {
+            // PRT-ECORE: the compile cores are the efficiency cores, the others the game's.
+            result.compile_ids = result.slow_ids;
+            result.game_ids = result.fast_ids;
+            LOG_INFO(Common, "PRT-ECORE: driver compiles on the {} efficiency logical processors "
+                             "(every core only while the game waits, never in a race){}",
+                     result.slow_ids.size(),
+                     CompileCoresOn() ? "" : ", off (RYGT_COMPILE_CORES=0)");
+        }
         if (!result.hybrid) {
             // PERF-GT7-024: in a GT7 race after a new track's start, ~1,100 new pipelines took four
             // cores for ~90 s, the driver's compiler threads anywhere: the game and the renderer
@@ -541,7 +564,9 @@ bool ForEachProcessThread(unsigned long access,
 
 void ConfineDriverCompileThreads() {
     const auto& classes = GetCoreClasses();
-    if (classes.hybrid || classes.compile_ids.empty() || !CompileCoresOn()) {
+    // PRT-ECORE: hybrid CPUs too, with the efficiency cores as the compile cores.
+    if ((classes.hybrid && !EcoreDriverCompileOn()) || classes.compile_ids.empty() ||
+        !CompileCoresOn()) {
         return;
     }
     uintptr_t compiler_begin = 0, compiler_end = 0;

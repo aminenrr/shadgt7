@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <chrono>
 #include <functional>
 #include <map>
@@ -606,9 +607,20 @@ void Scheduler::PerfMonitorThread(std::stop_token stoken) {
     // pre-race spikes in two runs. Low priority, so the game's and the renderer's threads come
     // first, and the snapshots every 10 s.
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
-    if (Common::DiagnosticsBuilt) {
+    // PRT-PERF (pr-tests, RYGT_PERF_LINE=0 turns it off): in builds without diagnostics, one line
+    // every 10 s with the GPU's busy share and the busiest threads, to tell GPU-bound from
+    // CPU-bound frames in a player's log (the diagnostic build's lines above, every 10 s).
+    static const bool perf_line = !Common::DiagnosticsBuilt && [] {
+        const char* env = std::getenv("RYGT_PERF_LINE");
+        return !(env && env[0] == '0');
+    }();
+    if (Common::DiagnosticsBuilt || perf_line) {
         Common::SampleThreadCpuUsage(0);
     }
+    u64 line_samples = 0;
+    u64 line_busy = 0;
+    u64 line_tick = CurrentTick();
+    auto line_start = std::chrono::steady_clock::now();
     u32 windows = 0;
     auto window_start = std::chrono::steady_clock::now();
     u64 samples = 0;
@@ -628,6 +640,22 @@ void Scheduler::PerfMonitorThread(std::stop_token stoken) {
         const bool sample_threads = ++windows % 5 == 0; // PERF-GT7-054: every 10 s
         if (sample_threads) {
             Common::ConfineDriverCompileThreads(); // PERF-GT7-024
+        }
+        line_samples += samples;
+        line_busy += busy_samples;
+        if (perf_line && sample_threads) {
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-PERF {:.1f} s: GPU busy {:.0f}% (95%+ = GPU-bound), {} submits; "
+                        "CPU {}",
+                        std::chrono::duration<double>(now - line_start).count(),
+                        line_samples ? line_busy * 100.0 / line_samples : 0.0, tick - line_tick,
+                        Common::SampleThreadCpuUsage(8));
+        }
+        if (sample_threads) {
+            line_samples = 0;
+            line_busy = 0;
+            line_tick = tick;
+            line_start = now;
         }
         // The reports, not the thread: it also confines the driver's compile threads and
         // watches for a stuck GPU (DIAG-103) in every build.

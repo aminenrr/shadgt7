@@ -1510,6 +1510,9 @@ private:
     std::unordered_map<u64, std::unique_ptr<VideoCore::Sampler>> samplers;
     std::unordered_map<u64, vk::Sampler> sampler_lookup;
     vk::Sampler last_sampler{};
+    /// PRT-SAMPLER: the first sampler made per coarse state (filters, clamps, compare, border
+    /// type; no levels of detail or border colour), the stand-in once the device's limit is near.
+    std::unordered_map<u64, vk::Sampler> sampler_coarse;
 
     std::mutex views_mutex;
     std::unordered_map<const Native::ImageEntry*, std::vector<ViewRecord>> views;
