@@ -77,6 +77,7 @@ private:
     u32 cur_image{};
     std::vector<Img> available_imgs;
     bool failed{};
+    u32 retry_in{}; ///< FIX-PRT-DLSS: frames before DLSS is tried again after a failure
 };
 
 } // namespace Vulkan::RytyDlss

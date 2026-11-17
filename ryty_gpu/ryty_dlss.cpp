@@ -269,6 +269,11 @@ vk::ImageView Pass::Render(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::
     // DLSS-GT7-001: the game's pictures are only changed for DLSS while Streamline's DLSS scales
     // them and takes the inputs (set again by RytyDlssG::Upscale).
     auto& temporal_usable = RytyUpscale::TemporalUsable();
+    // FIX-PRT-DLSS (pr-tests): a failure pauses DLSS for ~2 s (FSR or plain scaling meanwhile),
+    // then it is tried again; it is never off for the rest of the run.
+    if (failed && retry_in != 0 && --retry_in == 0) {
+        failed = false;
+    }
     if ((!g_plugin.ready && !g_streamline) || failed) {
         temporal_usable.store(false, std::memory_order_relaxed);
         return input;
@@ -347,9 +352,10 @@ vk::ImageView Pass::Render(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::
             : g_plugin.evaluate(static_cast<VkCommandBuffer>(cmdbuf), &in, &out, 0.0f) == 0;
     if (!ok) {
         // The output was not written; stop trying and let FSR (or plain scaling) take over.
-        LOG_ERROR(Render_Vulkan, "ryGT DLSS: {}; falling back to FSR",
+        LOG_ERROR(Render_Vulkan, "ryGT DLSS: {}; FSR for ~2 s, then DLSS again",
                   g_streamline ? std::string{"Streamline's DLSS failed"} : LastError());
         failed = true;
+        retry_in = 120;
         temporal_usable.store(false, std::memory_order_relaxed);
     }
 

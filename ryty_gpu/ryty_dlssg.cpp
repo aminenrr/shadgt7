@@ -1042,14 +1042,17 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     // motion vectors and jitter, DLSS keeps its history from frame to frame. A refusal from
     // Streamline ends the prototype for the run, and the frame is scaled as before.
     // pr-tests: a refusal (seen when the VRAM budget was exceeded) now pauses the temporal pass
-    // for ~600 frames and retries; only the 8th refusal ends it for the run.
-    static bool temporal_refused = false;
+    // for ~600 frames and retries. FIX-PRT-DLSS: never ended for the run (from the 8th refusal
+    // the pause is ~3600 frames); the pause counts calls, so it ends even while DLSS fails.
+    constexpr bool temporal_refused = false; // FIX-PRT-DLSS: never set any more
     static u32 temporal_refusals = 0;
     static u64 temporal_retry_at = 0;
     static bool last_temporal = false;
     static u64 temporal_frames = 0;
     static u64 flat_frames = 0;
-    const bool temporal_paused = temporal_frames + flat_frames < temporal_retry_at;
+    static u64 calls = 0;
+    ++calls;
+    const bool temporal_paused = calls < temporal_retry_at;
     const bool use_temporal = temporal && !temporal_refused && !temporal_paused &&
                               temporal->size == input_size &&
                               temporal->depth_view && temporal->motion_view;
@@ -1062,10 +1065,8 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
         const char* env = std::getenv("RYGT_DLSS_SIDE_VIEWPORT");
         return !(env && env[0] == '0');
     }();
-    static u64 calls = 0;
     static u64 last_temporal_call = 0;
     static u64 side_frames = 0;
-    ++calls;
     const bool side = side_wanted && !use_temporal && last_temporal && !temporal_refused &&
                       RytyUpscale::TemporalRequested() && last_temporal_call != 0 &&
                       calls - last_temporal_call <= 3;
@@ -1203,12 +1204,12 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
         ok = run(temporal);
         if (!ok) {
             if (++temporal_refusals >= 8) {
-                temporal_refused = true;
+                temporal_retry_at = calls + 3600; // FIX-PRT-DLSS: never for the rest of the run
                 LOG_ERROR(Render_Vulkan, "DLSS-GT7-001: the temporal inputs were refused {} "
-                                         "times; DLSS runs on single frames for the rest of this run",
+                                         "times; single frames for ~3600 frames, then temporal again",
                           temporal_refusals);
             } else {
-                temporal_retry_at = temporal_frames + flat_frames + 600;
+                temporal_retry_at = calls + 600;
                 LOG_ERROR(Render_Vulkan, "DLSS-GT7-001: the temporal inputs were refused ({} of 8); "
                                          "single frames for ~600 frames, then temporal again",
                           temporal_refusals);
@@ -1250,7 +1251,7 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     // DLSS-GT7-001: from the next frame on the native renderer may replace the game's
     // anti-aliasing for DLSS (ryty_upscale.h), unless Streamline refused the inputs.
     RytyUpscale::TemporalUsable().store(
-        ok && !temporal_refused && temporal_frames + flat_frames >= temporal_retry_at,
+        ok && !temporal_refused && calls >= temporal_retry_at,
         std::memory_order_relaxed);
     return ok;
 }

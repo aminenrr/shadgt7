@@ -5577,7 +5577,7 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
         if (++ui_draws == 1) {
             LOG_INFO(Render_Vulkan, "Native UI: drawing {}x{} over a {}x{} scene; DLSS {}",
                      proxy.size.width, proxy.size.height, proxy.native.width, proxy.native.height,
-                     proxy.scaled_view && !proxy.dlss_failed);
+                     proxy.scaled_view && proxy.dlss_retry_in == 0);
         }
         return;
     }

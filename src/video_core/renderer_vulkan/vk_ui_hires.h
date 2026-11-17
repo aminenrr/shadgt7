@@ -90,7 +90,9 @@ struct Proxy {
     std::vector<std::pair<std::pair<vk::Format, bool>, vk::UniqueImageView>> views;
     vk::ImageLayout layout = vk::ImageLayout::eUndefined;
     Phase phase = Phase::Idle;
-    bool dlss_failed = false;
+    /// FIX-PRT-DLSS (pr-tests): frames left before DLSS is tried again after it failed (it never
+    /// stops for good: a failure, e.g. over the VRAM budget, only pauses it for ~2 s).
+    u32 dlss_retry_in = 0;
     bool dlss_used = false;
     bool native_stale = false; ///< the proxy got draws the display buffer has not
     bool native_dirty = false; ///< native draws must be copied back to the proxy
@@ -415,7 +417,10 @@ inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::I
                           vk::ImageView view, vk::Format format, Proxy& proxy,
                           bool allow_dlss = true,
                           const RytyUpscale::TemporalInputs* temporal = nullptr) {
-    const bool dlss = allow_dlss && !proxy.dlss_failed &&
+    if (proxy.dlss_retry_in != 0) {
+        --proxy.dlss_retry_in;
+    }
+    const bool dlss = allow_dlss && proxy.dlss_retry_in == 0 &&
                       RytyDlss::CanScale(proxy.native, proxy.size) && CreateScaled(instance, proxy);
     const auto input_layout =
         dlss ? vk::ImageLayout::eShaderReadOnlyOptimal : vk::ImageLayout::eTransferSrcOptimal;
@@ -424,7 +429,7 @@ inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::I
         dlss && RytyDlss::ScaleInto(cmd, image, view, format, proxy.native, proxy.scaled,
                                     *proxy.scaled_view, proxy.size, temporal);
     if (dlss && !scaled) {
-        proxy.dlss_failed = true;
+        proxy.dlss_retry_in = 120; // FIX-PRT-DLSS: plain scaling for ~2 s, then DLSS again
         NativeBarrier(cmd, image, input_layout, vk::ImageLayout::eTransferSrcOptimal);
     }
     proxy.dlss_used = scaled;
@@ -534,7 +539,7 @@ inline std::optional<Shown> TakeFrame(const Instance& instance, vk::CommandBuffe
         proxy.present_format = view_format;
         proxy.size = size;
         proxy.native = native;
-        proxy.dlss_failed = false;
+        proxy.dlss_retry_in = 0;
     }
     return shown;
 }
