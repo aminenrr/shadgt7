@@ -696,8 +696,9 @@ private:
     static constexpr size_t MaxPrefetchedModules = 1024;
     u64 prefetched_evicted = 0; ///< under prefetched_mutex
 
-    /// PRT-PREWARM (pr-tests, RYGT_PIPELINE_PREWARM=1, off by default): each pipeline the game
-    /// builds is recorded in the shader store (its key alone: its stages are stored translations).
+    /// PRT-PREWARM (pr-tests, on by default, RYGT_PIPELINE_PREWARM=0 turns it off): each pipeline
+    /// the game builds is recorded (its key alone, in <serial>.prewarm: PRT-KEEP; its stages are
+    /// stored translations).
     /// At the next start, once the manifest pre-translation is done, the recorded pipelines are
     /// built on low-priority threads (paused in races) from the stored translations, and a draw
     /// whose key is one of them takes it instead of building it (no skipped draws, no pop-in).
@@ -714,6 +715,8 @@ private:
     const PrewarmStage* GetPrewarmStage(u64 perm_hash);
     /// A new pipeline was installed for the current key: recorded once.
     void NotePipelineInstalled();
+    /// PRT-KEEP diagnosis: a new key whose stages match a recorded key's: which bytes differ.
+    void NotePrewarmMiss(const GraphicsPipelineKey& key);
     /// A prewarmed pipeline for the key, taken out (null when none).
     std::unique_ptr<GraphicsPipeline> TakePrewarmed(const GraphicsPipelineKey& key);
     bool PrewarmReady(const GraphicsPipelineKey& key);
@@ -726,6 +729,8 @@ private:
     std::unordered_set<u64> prewarm_seen;     ///< keys (hashed) the game built or took
     std::unordered_set<u64> prewarm_recorded; ///< keys (hashed) already in the store
     std::unordered_map<u64, size_t> prewarm_else_fixed; ///< FIX-018 boundaries at start
+    std::unordered_map<u64, GraphicsPipelineKey> prewarm_by_stages; ///< PRT-KEEP diagnosis
+    u32 prewarm_misses = 0;                                         ///< under prewarm_mutex
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> prewarm_ready;
     std::atomic<u32> prewarm_waiting{}; ///< size of prewarm_ready
     std::atomic<u32> prewarm_installed{};

@@ -155,12 +155,16 @@ static bool TranslateJobsDiag() {
 // and its SPIR-V's hash. The code and the fetch shader go to a local capture, never into a record.
 // RYGT_MANIFEST_RECORD=1 writes them; RYGT_MANIFEST_VERIFY=1 translates every record again at
 // start from the capture, replaying the reads, and compares the SPIR-V.
+// PRT-KEEP (pr-tests): on by default (=0 turns it off): the manifest is what the pre-translation
+// rebuilds the shader store from after a renderer update (SHD-010 clears the store), so the
+// recorded pipelines (PRT-PREWARM) are built again at the first start of a new build.
 static std::filesystem::path g_manifest_dir;
 static std::filesystem::path g_capture_dir;
+static std::filesystem::path g_prewarm_dir; ///< PRT-KEEP: the pipeline records (PRT-PREWARM)
 static bool ManifestRecordOn() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_MANIFEST_RECORD");
-        return env && env[0] == '1';
+        return !(env && env[0] == '0'); // PRT-KEEP: on by default
     }();
     return on;
 }
@@ -218,6 +222,41 @@ static bool WriteWords(const std::filesystem::path& file, std::span<const u32> w
     const bool ok = std::fwrite(words.data(), 4, words.size(), f) == words.size();
     std::fclose(f);
     return ok;
+}
+
+// PRT-KEEP (pr-tests): the index a recorded translation had in the shader store, kept next to its
+// manifest record (<program>-<spv>.idx, one u32). After a renderer update clears the store
+// (SHD-010), the pre-translation puts each record back at its old index where it can, so the
+// pipelines recorded with those indices (PRT-PREWARM) find the same translations again. Written
+// again whenever a draw takes a new translation of it (its index in the store of that build).
+static std::filesystem::path ManifestIndexFile(const std::filesystem::path& manifest_dir, u64 hash,
+                                               u64 spv_xxh) {
+    return manifest_dir / fmt::format("{:016x}-{:016x}.idx", hash, spv_xxh);
+}
+
+static void WriteManifestIndex(const std::filesystem::path& manifest_dir, u64 hash, u64 spv_xxh,
+                               u32 perm_idx) {
+    std::error_code ec;
+    std::filesystem::create_directories(manifest_dir, ec);
+    const auto file = ManifestIndexFile(manifest_dir, hash, spv_xxh);
+    if (std::FILE* f = std::fopen(file.string().c_str(), "wb")) {
+        std::fwrite(&perm_idx, sizeof(perm_idx), 1, f);
+        std::fclose(f);
+    }
+}
+
+/// ~0u when the record has no index file (recorded before PRT-KEEP) or it is unreadable.
+static u32 ReadManifestIndex(const std::filesystem::path& record_file) {
+    auto file = record_file;
+    file.replace_extension(".idx");
+    u32 perm_idx = ~0u;
+    if (std::FILE* f = std::fopen(file.string().c_str(), "rb")) {
+        if (std::fread(&perm_idx, sizeof(perm_idx), 1, f) != 1) {
+            perm_idx = ~0u;
+        }
+        std::fclose(f);
+    }
+    return perm_idx;
 }
 
 static std::vector<u32> ReadWords(const std::filesystem::path& file) {
@@ -1570,7 +1609,9 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
     struct Stored {
         u32 next_idx = 0;
         std::vector<Shader::StageSpecialization> specs;
+        std::unordered_set<u32> used; ///< PRT-KEEP: indices this pre-translation took
     };
+    std::atomic<u32> at_old_index{0};
     std::unordered_map<u64, Stored> programs;
     const auto work = [&] {
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
@@ -1578,6 +1619,7 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
         for (size_t i = next++; i < files.size() && !stop.stop_requested(); i = next++) {
             BootProgress::translate_done.fetch_add(1, std::memory_order_relaxed); // PRT-SPLASH
             ManifestRecord r;
+            const u32 old_idx = ReadManifestIndex(files[i]); // PRT-KEEP
             if (!ReadManifestRecord(files[i], r) ||
                 Shader::SwStage(r.sw_stage) == Shader::SwStage::Geometry) {
                 ++failed; // geometry shaders: see the recording
@@ -1684,10 +1726,18 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
                     continue;
                 }
                 auto& end = stored_perm_end[r.hash];
-                perm_idx = u32(std::max<size_t>(end, program.next_idx));
-                end = perm_idx + 1;
+                // PRT-KEEP: back at the index it had in the store that recorded it, when free
+                // (a listing stops at a gap of eight: indices far past the others are not used).
+                if (old_idx < 256 && !program.used.contains(old_idx)) {
+                    perm_idx = old_idx;
+                    ++at_old_index;
+                } else {
+                    perm_idx = u32(std::max<size_t>(end, program.next_idx));
+                }
+                end = std::max<size_t>(end, size_t{perm_idx} + 1);
             }
-            program.next_idx = perm_idx + 1;
+            program.used.insert(perm_idx);
+            program.next_idx = std::max(program.next_idx, perm_idx + 1);
             RegisterShaderMeta(*info, spec->fetch_shader_data, *spec, HashCombine(r.hash, u64{perm_idx}),
                                perm_idx);
             RegisterShaderBinary(std::move(spv), r.hash, perm_idx);
@@ -1707,19 +1757,20 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
                 "PERF-GT7-117: {} records in {:.1f} s on {} threads: {} translations stored, {} "
                 "for programs already stored or in use, {} duplicates, {} with reads not replayed "
                 "as recorded (not stored), {} without local code, {} failed; {} programs in use "
-                "left alone",
+                "left alone; PRT-KEEP: {} at their old index",
                 files.size(),
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count(),
                 count, stored.load(), already.load(), duplicate.load(), unreplayed.load(),
-                no_code.load(), failed.load(), in_use.load());
+                no_code.load(), failed.load(), in_use.load(), at_old_index.load());
 }
 
-// PRT-PREWARM (pr-tests): RYGT_PIPELINE_PREWARM=1 records the game's pipelines and builds them
-// again at the next start (PipelineCache::PrewarmPipelines). Off by default.
+// PRT-PREWARM (pr-tests): records the game's pipelines and builds them again at the next start
+// (PipelineCache::PrewarmPipelines). On by default since 2026-11-17 (owner);
+// RYGT_PIPELINE_PREWARM=0 turns it off.
 static bool PrewarmOn() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_PIPELINE_PREWARM");
-        return env && env[0] == '1';
+        return !(env && env[0] == '0');
     }();
     return on;
 }
@@ -2287,12 +2338,14 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         const auto gpu = fmt::format("{:04x}-{:04x}", instance.GetVendorID(), instance.GetDeviceID());
         g_manifest_dir = cache_dir / fmt::format("{}.manifest", serial) / gpu;
         g_capture_dir = cache_dir / fmt::format("{}.capture", serial);
+        g_prewarm_dir = cache_dir / fmt::format("{}.prewarm", serial) / gpu; // PRT-KEEP
         const char* verify = std::getenv("RYGT_MANIFEST_VERIFY");
         if (verify && verify[0] == '1') {
             verify_thread = std::jthread([this](std::stop_token stop) { VerifyManifest(stop); });
         }
+        // PRT-KEEP (pr-tests): on by default (=0 turns it off).
         const char* pretranslate = std::getenv("RYGT_MANIFEST_PRETRANSLATE");
-        pretranslate_wanted = pretranslate && pretranslate[0] == '1';
+        pretranslate_wanted = !(pretranslate && pretranslate[0] == '0');
     }
     if (WarmComputeOn()) { // PERF-GT7-037
         warm_compute_thread =
@@ -5094,7 +5147,7 @@ vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx,
     return CompileSPV(spv, instance.GetDevice(), instance.IsShaderObjectEnabled());
 }
 
-// PRT-PREWARM (pr-tests): the pipeline prewarm. RYGT_PIPELINE_PREWARM=1 (off by default).
+// PRT-PREWARM (pr-tests): the pipeline prewarm. On by default (RYGT_PIPELINE_PREWARM=0: off).
 // Lance removed the old precompile (WarmUp, PERF-024) in da66c3a8e3; this re-ports its idea to
 // today's cache. While playing, each new pipeline's key is kept in the shader store (a .key file:
 // its stages are the store's translations, by permutation hash). At the next start, once the
@@ -5110,9 +5163,35 @@ vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx,
 namespace {
 constexpr u32 PrewarmRecordMagic = 0x57505247; // "GRPW"
 constexpr u32 PrewarmRecordVersion = 1;
+// PRT-KEEP: records are files outside the shader store (<serial>.prewarm/<gpu>/<key>.pwk), so a
+// renderer update's store clear (SHD-010) leaves them. Bump PrewarmKeyLayout whenever
+// GraphicsPipelineKey's fields change (its size alone can stay the same): records of another
+// layout are not read.
+constexpr u32 PrewarmFileVersion = 2;
+constexpr u32 PrewarmKeyLayout = 1;
 
-std::string PrewarmRecordName(u64 key_hash) {
-    return fmt::format("prewarm-{:016x}", key_hash);
+u64 PrewarmStagesHash(const GraphicsPipelineKey& key) {
+    return XXH3_64bits(key.stage_hashes.data(), sizeof(key.stage_hashes));
+}
+
+/// PRT-KEEP: writes a pipeline's record file (<key hash>.pwk in g_prewarm_dir).
+void WritePrewarmFile(const GraphicsPipelineKey& key, u64 hash) {
+    const std::array<u32, 4> header{PrewarmRecordMagic, PrewarmFileVersion,
+                                    static_cast<u32>(sizeof(GraphicsPipelineKey)),
+                                    PrewarmKeyLayout};
+    std::vector<u8> data(sizeof(header) + sizeof(GraphicsPipelineKey));
+    std::memcpy(data.data(), header.data(), sizeof(header));
+    std::memcpy(data.data() + sizeof(header), &key, sizeof(key));
+    std::error_code ec;
+    std::filesystem::create_directories(g_prewarm_dir, ec);
+    const auto file = g_prewarm_dir / fmt::format("{:016x}.pwk", hash);
+    if (std::FILE* f = std::fopen(file.string().c_str(), "wb")) {
+        const bool ok = std::fwrite(data.data(), 1, data.size(), f) == data.size();
+        std::fclose(f);
+        if (!ok) {
+            std::filesystem::remove(file, ec);
+        }
+    }
 }
 
 bool PrewarmColorTargetsSupported(const GraphicsPipelineKey& key) {
@@ -5187,9 +5266,9 @@ void PipelineCache::NotePipelineInstalled() {
             return;
         }
     }
+    NotePrewarmMiss(key); // PRT-KEEP diagnosis
     if (key.stage_hashes[u32(Shader::SwStage::Geometry)] != 0 ||
-        key.stage_hashes[u32(Shader::SwStage::Vertex)] == 0 ||
-        !Storage::DataBase::Instance().IsOpened()) {
+        key.stage_hashes[u32(Shader::SwStage::Vertex)] == 0 || g_prewarm_dir.empty()) {
         return;
     }
     for (const auto* info : S().infos) {
@@ -5197,13 +5276,55 @@ void PipelineCache::NotePipelineInstalled() {
             return;
         }
     }
-    const std::array<u32, 3> header{PrewarmRecordMagic, PrewarmRecordVersion,
-                                    static_cast<u32>(sizeof(GraphicsPipelineKey))};
-    std::vector<u8> data(sizeof(header) + sizeof(GraphicsPipelineKey));
-    std::memcpy(data.data(), header.data(), sizeof(header));
-    std::memcpy(data.data() + sizeof(header), &key, sizeof(key));
-    Storage::DataBase::Instance().Save(Storage::BlobType::PipelineKey, PrewarmRecordName(hash),
-                                       std::move(data));
+    WritePrewarmFile(key, hash);
+}
+
+// PRT-KEEP (pr-tests) diagnosis: a pipeline the game builds whose stages (the same stored
+// translations) match a recorded pipeline's but whose key differs elsewhere: the key's bytes that
+// differ, for the first 20, then a count every 100. Tells which state keeps such pipelines from
+// being prewarmed.
+void PipelineCache::NotePrewarmMiss(const GraphicsPipelineKey& key) {
+    std::string ranges;
+    u32 count = 0;
+    {
+        std::scoped_lock lk{prewarm_mutex};
+        const auto it = prewarm_by_stages.find(PrewarmStagesHash(key));
+        if (it == prewarm_by_stages.end()) {
+            return;
+        }
+        const auto* a = reinterpret_cast<const u8*>(&it->second);
+        const auto* b = reinterpret_cast<const u8*>(&key);
+        if (std::memcmp(a, b, sizeof(key)) == 0) {
+            return;
+        }
+        count = ++prewarm_misses;
+        if (count > 20 && count % 100 != 0) {
+            return;
+        }
+        if (count <= 20) {
+            for (size_t i = 0; i < sizeof(key) && ranges.size() < 200;) {
+                if (a[i] == b[i]) {
+                    ++i;
+                    continue;
+                }
+                size_t j = i;
+                while (j < sizeof(key) && a[j] != b[j]) {
+                    ++j;
+                }
+                ranges += fmt::format(" [{}..{})", i, j);
+                i = j;
+            }
+        }
+    }
+    if (count <= 20) {
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-KEEP: a new pipeline has a recorded one's stages but another key (miss "
+                    "{}; key {} bytes, differing:{})",
+                    count, sizeof(key), ranges);
+    } else {
+        LOG_WARNING(Render_Vulkan, "PRT-KEEP: {} new pipelines had a recorded one's stages but "
+                                   "another key", count);
+    }
 }
 
 const PipelineCache::PrewarmStage* PipelineCache::GetPrewarmStage(u64 perm_hash) {
@@ -5338,6 +5459,37 @@ void PipelineCache::PrewarmPipelines(std::stop_token stop) {
     }
     std::vector<GraphicsPipelineKey> keys;
     u32 unreadable = 0;
+    // PRT-KEEP: the record files (kept across renderer updates), then the store's records of
+    // the first prewarm build (2026-11-17), each given a file here so the next store clear
+    // keeps it.
+    std::unordered_set<u64> in_files;
+    {
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(g_prewarm_dir, ec)) {
+            if (stop.stop_requested()) {
+                break;
+            }
+            if (entry.path().extension() != ".pwk") {
+                continue;
+            }
+            std::array<u32, 4> header{};
+            GraphicsPipelineKey key{};
+            bool ok = false;
+            if (std::FILE* f = std::fopen(entry.path().string().c_str(), "rb")) {
+                ok = std::fread(header.data(), sizeof(header), 1, f) == 1 &&
+                     header[0] == PrewarmRecordMagic && header[1] == PrewarmFileVersion &&
+                     header[2] == sizeof(GraphicsPipelineKey) && header[3] == PrewarmKeyLayout &&
+                     std::fread(static_cast<void*>(&key), sizeof(key), 1, f) == 1;
+                std::fclose(f);
+            }
+            if (ok) {
+                in_files.insert(std::hash<GraphicsPipelineKey>{}(key));
+                keys.push_back(key);
+            } else {
+                ++unreadable;
+            }
+        }
+    }
     try {
         Storage::DataBase::Instance().ForEachBlob(
             Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
@@ -5354,6 +5506,10 @@ void PipelineCache::PrewarmPipelines(std::stop_token stop) {
                 }
                 GraphicsPipelineKey key{};
                 std::memcpy(static_cast<void*>(&key), data.data() + sizeof(header), sizeof(key));
+                const u64 hash = std::hash<GraphicsPipelineKey>{}(key);
+                if (in_files.insert(hash).second && !g_prewarm_dir.empty()) {
+                    WritePrewarmFile(key, hash); // PRT-KEEP: moved out of the store
+                }
                 keys.push_back(key);
             });
     } catch (const std::exception& e) {
@@ -5361,9 +5517,17 @@ void PipelineCache::PrewarmPipelines(std::stop_token stop) {
                     e.what());
     }
     {
+        // The two sources can hold the same key: once each.
+        std::unordered_set<u64> unique;
+        std::erase_if(keys, [&](const GraphicsPipelineKey& key) {
+            return !unique.insert(std::hash<GraphicsPipelineKey>{}(key)).second;
+        });
+    }
+    {
         std::scoped_lock lk{prewarm_mutex};
         for (const auto& key : keys) {
             prewarm_recorded.insert(std::hash<GraphicsPipelineKey>{}(key));
+            prewarm_by_stages.emplace(PrewarmStagesHash(key), key); // PRT-KEEP diagnosis
         }
     }
     BootProgress::prewarm_done.store(0, std::memory_order_relaxed);
@@ -6151,6 +6315,10 @@ bool PipelineCache::TakeReadyTranslation(HwStage hw_stage, SwStage sw_stage, u64
         const u64 perm_hash = HashCombine(hash, perm_idx);
         RegisterShaderMeta(info, job->spec.fetch_shader_data, job->spec, perm_hash, perm_idx);
         const u64 spv_hash = XXH3_64bits(job->spv.data(), job->spv.size() * sizeof(u32));
+        if (ManifestRecordOn() && !g_manifest_dir.empty() &&
+            job->sw_stage != Shader::SwStage::Geometry) { // PRT-KEEP
+            WriteManifestIndex(g_manifest_dir, hash, spv_hash, u32(perm_idx));
+        }
         Vulkan::SetObjectName(instance.GetDevice(), job->module,
                               GetShaderName(job->hw_stage, hash, perm_idx));
         program.InsertPermut(job->module, std::move(job->spec), std::move(job->info), perm_idx);

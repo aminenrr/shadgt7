@@ -228,7 +228,7 @@ void DrawCompileNotice() {
 bool SplashProgressOn() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_SPLASH_SHADER_PROGRESS");
-        return env && env[0] == '1';
+        return !(env && env[0] == '0'); // on by default since 2026-11-17 (owner)
     }();
     return on;
 }
@@ -252,8 +252,13 @@ void DrawBootShaderProgress() {
     const bool translating = Progress::translate_running.load(std::memory_order_acquire);
     const bool prewarming = Progress::prewarm_running.load(std::memory_order_acquire);
     const bool running = translating || prewarming;
+    // PRT-SPLASH fix (2026-11-17): the work can start, and even end, before the splash screen
+    // shows (a 1.5 s prewarm did): it is noted from the start, and the bar shows from the
+    // splash screen's first frame, "Shaders ready" held 2 s from there when it was already done.
+    static bool saw_work = false;
+    saw_work |= running;
     if (!armed) {
-        if (!running || !Libraries::SystemService::IsSplashVisible()) {
+        if (!saw_work || !Libraries::SystemService::IsSplashVisible()) {
             return;
         }
         armed = true;
@@ -266,7 +271,7 @@ void DrawBootShaderProgress() {
             finished = Clock::now();
         }
         const float since = std::chrono::duration<float>(Clock::now() - finished).count();
-        alpha = std::clamp(1.0f - (since - 1.5f) / 0.5f, 0.0f, 1.0f);
+        alpha = std::clamp(1.0f - (since - 2.0f) / 0.5f, 0.0f, 1.0f);
         if (alpha <= 0.0f) {
             return;
         }
@@ -289,7 +294,13 @@ void DrawBootShaderProgress() {
     const float fraction = running ? (total ? float(done) / float(total) : 0.0f) : 1.0f;
     char text[128];
     if (!running) {
-        std::snprintf(text, sizeof(text), "Shaders ready");
+        const u32 pipelines = Progress::prewarm_total.load(std::memory_order_relaxed);
+        if (pipelines != 0) {
+            std::snprintf(text, sizeof(text), "Shaders ready   %s pipelines",
+                          WithThousands(pipelines).c_str());
+        } else {
+            std::snprintf(text, sizeof(text), "Shaders ready");
+        }
     } else if (total == 0) {
         std::snprintf(text, sizeof(text), "%s...", what);
     } else {
