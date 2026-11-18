@@ -16,6 +16,7 @@
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
 #include <fmt/ranges.h>
+#include "common/prt_bink.h"
 #include "common/debug.h"
 #include "common/diagnostics.h"
 #include "common/path_util.h"
@@ -3722,6 +3723,7 @@ void Rasterizer::RecordDeferredFenceLatency(std::chrono::steady_clock::time_poin
     const auto now = std::chrono::steady_clock::now();
     const u64 latency_us =
         std::chrono::duration_cast<std::chrono::microseconds>(now - deferred_at).count();
+    PrtBink::NoteFence(latency_us); // PRT-BINK (RYGT_DIAG_BINK=1)
     std::scoped_lock lk{deferred_fences_mutex};
     auto& stats = deferred_fence_stats;
     if (stats.count == 0 && stats.window_start == std::chrono::steady_clock::time_point{}) {

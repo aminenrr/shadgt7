@@ -4,6 +4,7 @@
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
+#include "common/prt_bink.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
@@ -303,6 +304,7 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
     if (gnm_vqid == 0) {
         return;
     }
+    PrtBink::SubmitScope prt_bink{true}; // PRT-BINK (RYGT_DIAG_BINK=1): the wait below counts
 
     std::scoped_lock lk{m_submit_lock};
     WaitGpuIdle();
@@ -2183,6 +2185,7 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
 
 static inline s32 PerformSubmit(u32 count, const u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes,
                                 const u32* ccb_gpu_addrs[], u32* ccb_sizes_in_bytes) {
+    PrtBink::SubmitScope prt_bink{false}; // PRT-BINK (RYGT_DIAG_BINK=1)
     if (DebugState.ShouldPauseInSubmit()) {
         DebugState.PauseGuestThreads();
     }

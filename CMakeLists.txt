@@ -854,6 +854,7 @@ set(COMMON src/common/logging/classes.cpp
            src/common/perf_monitor.cpp
            src/common/perf_monitor.h
            src/common/thread.cpp
+           src/common/prt_bink.h
            src/common/thread.h
            src/common/types.h
            src/common/uint128.h

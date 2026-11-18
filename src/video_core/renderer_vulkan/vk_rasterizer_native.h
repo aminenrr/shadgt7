@@ -420,6 +420,21 @@ private:
         u64 hd_late_restarts = 0;     ///< composites that found the proxy already scaled
         u64 hd_late_missed = 0;       ///< of those, frames the restart was off for
         u32 hd_late_logs = 0;
+        /// PRT-LATE: the display a late-scene restart left to scale (and its frame), whether the
+        /// draw being recorded is its composite, and how its scales went.
+        VAddr hd_late_address = 0;
+        u64 hd_late_frame = ~u64{0};
+        bool hd_late_pending = false;
+        bool hd_late_restart = false; ///< a late-scene restart (else the composite found it idle)
+        u64 hd_composite_temporal = 0; ///< composites scaled right after, with temporal inputs
+        u64 hd_composite_single = 0;   ///< composites left to the next display draw, scaled single
+        u64 hd_late_temporal = 0;     ///< scaled right after the composite, with temporal inputs
+        u64 hd_late_single = 0;       ///< scaled without them
+        u32 hd_late_single_logs = 0;
+        u64 hd_late_single_logged = 0;
+        u64 hd_race_off_frame = ~u64{0}; ///< PRT-LATE: the last frame the race sign was off
+        u64 hd_race_held_frame = ~u64{0};
+        u64 hd_race_held = 0;            ///< frames the hold kept HD race off
         u32 hd_depth_giveups = 0;     ///< =2: proxy given up for a depth draw (logged)
         u64 scene_draw_frame = ~u64{0}; ///< the frame the first draw into a display was seen in
         bool through = false;         ///< logged
@@ -864,6 +879,11 @@ private:
     /// GPU.hd_ui (vk_ui_hires.h): a draw into a display buffer after the scene composite goes to
     /// the buffer's output-size proxy; draws and copies that read the buffer get the proxy's
     /// picture first.
+    /// PRT-LATE: scales a late-scene proxy right after its composite (pr-tests).
+    void ScaleAfterLateComposite(const Targets& targets, bool deferred);
+    void NoteLateSingle(bool restart, const char* why);
+    /// PRT-LATE: a race's HUD seen, with RYGT_HD_RACE_HOLD's hold.
+    bool HdRace();
     void PrepareUiTarget(Targets& targets, const GraphicsPipeline& pipeline,
                          const AmdGpu::Regs& regs);
     void FinishUiTargets(const Targets& targets);

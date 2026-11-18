@@ -40,6 +40,7 @@
 #include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
 
+#include "common/prt_bink.h"
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/diagnostics.h"
@@ -923,6 +924,50 @@ static bool HdUiLateScene() {
         return (env && env[0] == '1') || HdUiMenuTdlss();
     }();
     return on;
+}
+// PRT-LATE (pr-tests, RYGT_HD_UI_LATE_TEMPORAL=0 turns it off): after a late-scene restart the
+// proxy scales right after the composite is drawn, in the same frame, with that frame's temporal
+// inputs. Before, it scaled at the next display draw, which in GT Auto comes in the next frame,
+// before that frame's anti-aliasing pass: no inputs, DLSS on a single jittered frame (shimmer).
+static bool HdUiLateTemporal() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_HD_UI_LATE_TEMPORAL");
+        return HdUiLateScene() && !(env && env[0] == '0');
+    }();
+    return on;
+}
+// PRT-LATE (pr-tests, RYGT_HD_RACE_HOLD=<frames>, 30 by default, 0 = off): the race sign HD UI
+// goes by (a map drawn with depth this frame) flickers in 3D menus. Once it is off, it stays off
+// this many frames before it may turn on again.
+static u64 HdRaceHold() {
+    static const u64 frames = [] {
+        const char* env = std::getenv("RYGT_HD_RACE_HOLD");
+        if (env && *env) {
+            return u64(std::strtoull(env, nullptr, 10));
+        }
+        return u64{30};
+    }();
+    return frames;
+}
+
+bool NativeRenderer::HdRace() {
+    const bool raw = temporal.hd_race_frame != ~u64{0} && frame - temporal.hd_race_frame <= 2;
+    const u64 hold = HdRaceHold();
+    if (hold == 0) {
+        return raw;
+    }
+    if (!raw) {
+        temporal.hd_race_off_frame = frame;
+        return false;
+    }
+    if (temporal.hd_race_off_frame == ~u64{0} || frame - temporal.hd_race_off_frame > hold) {
+        return true;
+    }
+    if (temporal.hd_race_held_frame != frame) {
+        temporal.hd_race_held_frame = frame;
+        ++temporal.hd_race_held;
+    }
+    return false;
 }
 
 bool NativeRenderer::HudSplitOn() {
@@ -5080,6 +5125,124 @@ void NativeRenderer::PrepareMapIcons(const Targets& targets, const GraphicsPipel
     }
 }
 
+// PRT-LATE: a late-scene proxy scaled without temporal inputs (why), counted and logged.
+void NativeRenderer::NoteLateSingle(bool restart, const char* why) {
+    if (!restart) {
+        ++temporal.hd_composite_single; // a composite that found the proxy idle (not logged)
+        return;
+    }
+    ++temporal.hd_late_single;
+    if (temporal.hd_late_single_logs < 16 ||
+        (temporal.hd_late_single_logs < 64 && frame >= temporal.hd_late_single_logged + 600)) {
+        ++temporal.hd_late_single_logs;
+        temporal.hd_late_single_logged = frame;
+        LOG_WARNING(Render_Vulkan,
+                    "HDUI-SRC: frame {}: late scene scaled single: {} (pass frame {}, replaced "
+                    "frame {}; {} late scene scaled single, {} scaled temporal)",
+                    frame, why, temporal.frame == ~u64{0} ? 0 : temporal.frame,
+                    temporal.replaced_frame == ~u64{0} ? 0 : temporal.replaced_frame,
+                    temporal.hd_late_single, temporal.hd_late_temporal);
+    }
+}
+
+// PRT-LATE (RYGT_HD_UI_LATE_TEMPORAL, on by default): the draw just recorded was the composite a
+// late-scene restart put back into the native display (PrepareUiTarget). The proxy scales now,
+// in the composite's own frame, with that frame's depth, motion vectors and jitter, as an
+// ordinary menu frame's proxy does at the draw after its composite. What does not fit is left
+// to the next display draw, as before, and counted there or here.
+void NativeRenderer::ScaleAfterLateComposite(const Targets& targets, bool deferred) {
+    temporal.hd_late_pending = false;
+    const auto* entry = targets.colors[0];
+    if (!entry || entry->info.guest_address != temporal.hd_late_address ||
+        temporal.hd_late_frame != frame) {
+        return; // another draw: the next display draw scales it (and counts it)
+    }
+    if (deferred) {
+        return; // recorded later than this point (PERF-GT7-060): left to the next display draw
+    }
+    auto& state = UiHires::Get();
+    std::unique_lock lock{state.mutex};
+    const auto found = state.proxies.find(entry->info.guest_address);
+    if (found == state.proxies.end() || found->second.size.width == 0) {
+        return;
+    }
+    auto& proxy = found->second;
+    if (proxy.phase != UiHires::Phase::Scene || proxy.native_dirty ||
+        entry->info.size.width != proxy.native.width ||
+        entry->info.size.height != proxy.native.height || entry->info.num_samples != 1 ||
+        entry->info.resources.layers != 1 || entry->info.resources.levels != 1) {
+        return;
+    }
+    const auto fits = [&](const Native::ImageEntry* image) {
+        return image && image->info.size.width == proxy.native.width &&
+               image->info.size.height == proxy.native.height;
+    };
+    const char* why = nullptr;
+    if (!RytyUpscale::TemporalActive() || temporal.frame != frame) {
+        why = "no anti-aliasing pass this frame";
+    } else if (temporal.replaced_frame != frame) {
+        why = "the pass's result was not replaced this frame";
+    } else if (temporal.mirror) {
+        why = "mirror frame";
+    } else if (!fits(temporal.depth) || !fits(temporal.motion)) {
+        why = "depth or motion vectors not the proxy's size";
+    }
+    if (why) {
+        // Left to the next display draw as before: a late scene is counted now, with the reason,
+        // not again there; an ordinary composite is counted there if it scales single.
+        if (temporal.hd_late_restart) {
+            temporal.hd_late_frame = ~u64{0};
+            NoteLateSingle(true, why);
+        }
+        return;
+    }
+    const vk::Format format = targets.color_formats[0];
+    if (!UiHires::CreateImages(r.instance, proxy, format)) {
+        return; // the next display draw finds the same and turns the proxy off
+    }
+    VideoCore::ImageViewInfo view_info{};
+    view_info.format = format;
+    const auto view = View(*entry, view_info, ViewUse::Sampled);
+    VideoCore::ImageViewInfo depth_info{};
+    depth_info.format = vk::Format::eR32Sfloat;
+    VideoCore::ImageViewInfo motion_info{};
+    motion_info.format = vk::Format::eR16G16Sfloat;
+    RytyUpscale::TemporalInputs inputs{};
+    inputs.depth = vk::Image{Handle<VkImage_T>(temporal.depth->image->NativeHandle())};
+    inputs.depth_view = View(*temporal.depth, depth_info, ViewUse::Sampled);
+    inputs.depth_format = static_cast<vk::Format>(temporal.depth->image->Desc().format);
+    inputs.motion = vk::Image{Handle<VkImage_T>(temporal.motion->image->NativeHandle())};
+    inputs.motion_view = View(*temporal.motion, motion_info, ViewUse::Sampled);
+    inputs.motion_format = static_cast<vk::Format>(temporal.motion->image->Desc().format);
+    inputs.size = proxy.native;
+    inputs.jitter[0] = temporal.jitter[0];
+    inputs.jitter[1] = temporal.jitter[1];
+    inputs.mvec_scale[0] = temporal.mvec_scale[0];
+    inputs.mvec_scale[1] = temporal.mvec_scale[1];
+    inputs.reset = temporal.reset;
+    if (!view || !inputs.depth_view || !inputs.motion_view) {
+        temporal.hd_late_frame = ~u64{0};
+        NoteLateSingle(temporal.hd_late_restart, "no view of the display, depth or motion vectors");
+        return;
+    }
+    temporal.hd_late_frame = ~u64{0};
+    Splice();
+    r.scheduler.EndRendering();
+    UiHires::UpscaleNative(r.instance, r.scheduler.DirectCommandBuffer(),
+                           vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())}, view,
+                           format, proxy, true, &inputs);
+    ++(temporal.hd_late_restart ? temporal.hd_late_temporal : temporal.hd_composite_temporal);
+    if (!HdRace()) {
+        ++temporal.hd_menu_temporal;
+    }
+    if (temporal.hd_late_temporal + temporal.hd_composite_temporal <= 4) {
+        LOG_INFO(Render_Vulkan,
+                 "HDUI-SRC: frame {}: PRT-LATE: {} scaled right after its composite, with "
+                 "temporal inputs (pass frame {})",
+                 frame, temporal.hd_late_restart ? "a late scene" : "the scene", temporal.frame);
+    }
+}
+
 void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& pipeline,
                                      const AmdGpu::Regs& regs) {
     targets.ui_depth_proxy = targets.ui_depth_write = false;
@@ -5131,8 +5294,11 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
                             "HDUI-SRC: frame {}: late scene: the composite (ps {:#x}) comes after "
                             "the proxy scaled; {} ({} late frames, {} left as before)",
                             frame, fs ? fs->pgm_hash : 0,
-                            restart ? "the proxy is copied back down, the composite drawn "
-                                      "natively, the proxy scales at the next display draw"
+                            restart ? (HdUiLateTemporal()
+                                           ? "the proxy is copied back down, the composite drawn "
+                                             "natively, the proxy scales right after it"
+                                           : "the proxy is copied back down, the composite drawn "
+                                             "natively, the proxy scales at the next display draw")
                                     : "drawn into the proxy as before (RYGT_HD_UI_LATE_SCENE off)",
                             temporal.hd_late_restarts, temporal.hd_late_missed);
             }
@@ -5143,6 +5309,12 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
                 // The composite covers what was drawn before it: the next scale may use DLSS.
                 proxy.phase = UiHires::Phase::Scene;
                 proxy.native_dirty = false;
+                // PRT-LATE: scaled right after this draw (ScaleAfterLateComposite), or else at
+                // the next display draw, which counts it when it scales without temporal inputs.
+                temporal.hd_late_address = entry->info.guest_address;
+                temporal.hd_late_frame = frame;
+                temporal.hd_late_restart = true;
+                temporal.hd_late_pending = HdUiLateTemporal();
                 return;
             }
         }
@@ -5374,6 +5546,15 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
         }
         if (proxy.phase == UiHires::Phase::Idle) {
             proxy.phase = UiHires::Phase::Scene;
+            // PRT-LATE: this frame's composite (the first display draw after its anti-aliasing
+            // pass) scales the proxy right after it is drawn, with this frame's temporal inputs,
+            // not at the next display draw, which may come in the next frame (GT Auto).
+            if (cb == 0 && temporal.composite_now && HdUiLateTemporal()) {
+                temporal.hd_late_address = entry->info.guest_address;
+                temporal.hd_late_frame = frame;
+                temporal.hd_late_restart = false;
+                temporal.hd_late_pending = true;
+            }
             return; // The first supported display draw remains the native scene composite.
         }
         if (proxy.phase != UiHires::Phase::Ui) {
@@ -5397,8 +5578,7 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
             // and jitter here, as the presenter's pass would; the UI is drawn after, at the
             // output size. Menus ("mirror" frames) and anything that does not fit stay single,
             // unless RYGT_HD_UI_MENU_TDLSS=1 (below).
-            const bool hd_race =
-                temporal.hd_race_frame != ~u64{0} && frame - temporal.hd_race_frame <= 2;
+            const bool hd_race = HdRace(); // PRT-LATE: with the hold
             const bool pass_now = RytyUpscale::TemporalActive() && temporal.frame == frame;
             const bool menu_tdlss = HdUiMenuTdlss() && !hd_race && pass_now &&
                                     !proxy.native_dirty && frame >= temporal.hd_menu_hold_until;
@@ -5501,6 +5681,21 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
                                 temporal.hd_menu_fallbacks, temporal.hd_menu_temporal);
                 }
             }
+            // PRT-LATE: a late-scene (or composite) proxy that scales here, at the next display
+            // draw.
+            if (temporal.hd_late_frame != ~u64{0} &&
+                temporal.hd_late_address == entry->info.guest_address) {
+                temporal.hd_late_frame = ~u64{0};
+                temporal.hd_late_pending = false;
+                if (!hd_temporal && !give_up) {
+                    const char* why =
+                        !pass_now ? "scaled at the next display draw, before this frame's pass"
+                        : temporal.replaced_frame != frame
+                            ? "scaled at the next display draw, the pass's result not replaced"
+                            : "scaled at the next display draw without temporal inputs";
+                    NoteLateSingle(temporal.hd_late_restart, why);
+                }
+            }
             // pr-tests (diagnosis): every 600 frames, the picture the proxy takes and why.
             if (frame >= temporal.hd_src_logged_frame + 600) {
                 temporal.hd_src_logged_frame = frame;
@@ -5519,7 +5714,9 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
                             "replaced {}, mirror {}, through {}, left {}, race HUD {}, read-back "
                             "{}, HD race {}, depth {}x{}, motion {}x{}, beside {}x{} (frame {}), "
                             "switch {}, native dirty {} ({} menu frames temporal, {} fell back, "
-                            "{} late scene, {} of them left as before)",
+                            "{} late scene, {} of them left as before; PRT-LATE: {} late scene "
+                            "scaled temporal, {} late scene scaled single, {} composites scaled "
+                            "temporal right after, {} single, HD race held {} frames)",
                             frame, entry->info.guest_address, proxy.native.width,
                             proxy.native.height, give_up ? "nothing (given up)" : source,
                             hd_temporal ? "" : (pass_now ? ", single DLSS" : ", single (no pass)"),
@@ -5532,7 +5729,9 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
                             temporal.raw_frame == ~u64{0} ? 0 : temporal.raw_frame,
                             HdUiMenuTdlssLevel(), proxy.native_dirty, temporal.hd_menu_temporal,
                             temporal.hd_menu_fallbacks, temporal.hd_late_restarts,
-                            temporal.hd_late_missed);
+                            temporal.hd_late_missed, temporal.hd_late_temporal,
+                            temporal.hd_late_single, temporal.hd_composite_temporal,
+                            temporal.hd_composite_single, temporal.hd_race_held);
             }
             if (give_up) {
                 // No rejoin this frame, and the interface is shifted by the jitter as with
@@ -11355,6 +11554,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     if (RytyUpscale::TemporalActive()) {
         NoteTemporalDraw(*pipeline, targets, b); // DLSS-GT7-001
     }
+    if (temporal.hd_late_pending) {
+        ScaleAfterLateComposite(targets, lds_deferred); // PRT-LATE
+    }
     ChunkFlushCheck();
     Report();
 }
@@ -11483,8 +11685,7 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
         return env && env[0] == '1'; // pr-tests: off by default now, =1 turns it on
     }();
     {
-        const bool hd_race =
-            temporal.hd_race_frame != ~u64{0} && frame - temporal.hd_race_frame <= 2;
+        const bool hd_race = HdRace(); // PRT-LATE: with the hold
         const bool safe = menu_safe && UiHires::Enabled() && !hd_race;
         if (safe) {
             temporal.hd_menu_safe_frame = frame;
@@ -11541,8 +11742,7 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
             const char* env = std::getenv("RYGT_HD_UI_MENU_TEMPORAL");
             return env && env[0] == '1';
         }();
-        const bool hd_race =
-            temporal.hd_race_frame != ~u64{0} && frame - temporal.hd_race_frame <= 2;
+        const bool hd_race = HdRace(); // PRT-LATE: with the hold
         // RYGT_HD_UI_MENU_TDLSS=1: menus take the pass too, unless one fell back just now.
         const bool tdlss = HdUiMenuTdlss() && !menu_temporal;
         const bool held = tdlss && frame < temporal.hd_menu_hold_until;
@@ -13143,9 +13343,11 @@ void NativeRenderer::DispatchDirect() {
     const ComputePipeline* pipeline = r.AcquireComputePipeline();
     if (!pipeline) {
         ++stats.no_pipeline;
+        PrtBink::NoteDispatch(0); // PRT-BINK
         return;
     }
     SyncUiReads(pipeline->GetStages()); // GPU.hd_ui
+    PrtBink::NoteDispatch(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash); // PRT-BINK
     const auto& regs = r.liverpool->DrawRegs();
     MetaClearDispatch(pipeline->GetStage(Shader::SwStage::Compute));
     split(0);
@@ -13270,9 +13472,11 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     const ComputePipeline* pipeline = r.AcquireComputePipeline();
     if (!pipeline) {
         ++stats.no_pipeline;
+        PrtBink::NoteDispatch(0); // PRT-BINK
         return;
     }
     SyncUiReads(pipeline->GetStages()); // GPU.hd_ui
+    PrtBink::NoteDispatch(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash); // PRT-BINK
     const auto& regs = r.liverpool->DrawRegs();
     if (r.FrameDumpActive()) {
         r.FrameDumpDispatch(pipeline->GetStage(Shader::SwStage::Compute),
@@ -14725,6 +14929,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     ++frame;
     TrimChunks();
     shared_frame.store(frame, std::memory_order_relaxed); // OPT-010
+    PrtBink::Tick(); // PRT-BINK (RYGT_DIAG_BINK=1)
     if (RyDiag::Enabled() && !AbOn()) {
         // DIAG-GT7-011: the recorder's stack samples of heavy frames (over 3,300 draws, as GT7's
         // pause menu) go to their own tag in recorder_profile.txt (2; the others 0).

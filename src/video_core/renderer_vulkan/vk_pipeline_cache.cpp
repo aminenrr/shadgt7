@@ -20,6 +20,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "common/prt_bink.h"
 #include "common/diagnostics.h"
 #include "common/elf_info.h"
 #include "common/guest_clock.h"
@@ -4711,6 +4712,7 @@ static s64 SteadyMs() {
 void PipelineCache::NoteAsyncSkip(const std::shared_ptr<PipelineBuild>& build, bool again) {
     catch_up_skips.fetch_add(1, std::memory_order_relaxed);
     build->skips.fetch_add(1, std::memory_order_relaxed); // DIAG-GT7-012
+    PrtBink::NoteBuildSkip(); // PRT-BINK (RYGT_DIAG_BINK=1)
     build->last_skip_ms.store(SteadyMs(), std::memory_order_relaxed);
     // A draw skipped again comes back frame after frame: it is on screen. Its build, if no worker
     // has started it, goes ahead of the queue (the job already queued finds it started and does
