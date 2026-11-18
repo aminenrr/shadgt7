@@ -936,6 +936,39 @@ static bool HdUiLateTemporal() {
     }();
     return on;
 }
+// PRT-GTAUTO G3 (pr-tests, RYGT_HD_UI_LATE_GIVE_UP=0 turns it off): a screen whose scene
+// composite comes after the HD UI picture already scaled (GT Auto) gives the picture up for the
+// frame: everything is drawn natively and the presenter's temporal DLSS takes the whole display,
+// as with HD UI off (sharp 3D; that screen's interface at the game's resolution). The owner's
+// 2026-11-18 test: HD UI off made GT Auto sharp, HD UI on left its 3D aliased and low-res.
+static bool HdUiLateGiveUp() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_HD_UI_LATE_GIVE_UP");
+        return HdUiLateScene() && !(env && env[0] == '0');
+    }();
+    return on;
+}
+// PRT-GTAUTO G1 (pr-tests, RYGT_HD_UI_LATE_SKIP_EARLY=1, off by default; only without G3): on
+// such a screen the display draws before the composite stay native and the picture scales once,
+// right after the composite, with temporal inputs: one DLSS call a frame instead of a single one
+// first and the restart after it.
+static bool HdUiLateSkipEarly() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_HD_UI_LATE_SKIP_EARLY");
+        return HdUiLateTemporal() && !HdUiLateGiveUp() && env && env[0] == '1';
+    }();
+    return on;
+}
+// PRT-HDUI-VP G2 (pr-tests, RYGT_HD_UI_OWN_VIEWPORT=1, off by default): the HD UI picture's
+// temporal DLSS runs on a Streamline viewport of its own (3).
+static unsigned HdUiViewport() {
+    static const unsigned viewport = [] {
+        const char* env = std::getenv("RYGT_HD_UI_OWN_VIEWPORT");
+        return env && env[0] == '1' ? 3u : 0u;
+    }();
+    return viewport;
+}
+
 // PRT-LATE (pr-tests, RYGT_HD_RACE_HOLD=<frames>, 30 by default, 0 = off): the race sign HD UI
 // goes by (a map drawn with depth this frame) flickers in 3D menus. Once it is off, it stays off
 // this many frames before it may turn on again.
@@ -5151,6 +5184,18 @@ void NativeRenderer::NoteLateSingle(bool restart, const char* why) {
 // ordinary menu frame's proxy does at the draw after its composite. What does not fit is left
 // to the next display draw, as before, and counted there or here.
 void NativeRenderer::ScaleAfterLateComposite(const Targets& targets, bool deferred) {
+    if (temporal.hd_late_wait_composite) {
+        // PRT-GTAUTO G1: held back for this frame's composite; the draws before it pass.
+        if (temporal.hd_late_frame != frame) {
+            temporal.hd_late_wait_composite = false;
+            temporal.hd_late_pending = false;
+            return;
+        }
+        if (!temporal.composite_now) {
+            return;
+        }
+        temporal.hd_late_wait_composite = false;
+    }
     temporal.hd_late_pending = false;
     const auto* entry = targets.colors[0];
     if (!entry || entry->info.guest_address != temporal.hd_late_address ||
@@ -5220,6 +5265,7 @@ void NativeRenderer::ScaleAfterLateComposite(const Targets& targets, bool deferr
     inputs.mvec_scale[0] = temporal.mvec_scale[0];
     inputs.mvec_scale[1] = temporal.mvec_scale[1];
     inputs.reset = temporal.reset;
+    inputs.viewport = HdUiViewport(); // PRT-HDUI-VP
     if (!view || !inputs.depth_view || !inputs.motion_view) {
         temporal.hd_late_frame = ~u64{0};
         NoteLateSingle(temporal.hd_late_restart, "no view of the display, depth or motion vectors");
@@ -5264,6 +5310,27 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
             continue;
         }
         auto& proxy = found->second;
+        // PRT-GTAUTO: the composite came after the display draw held back for it (G1, G3):
+        // the screen still composites late.
+        if (cb == 0 && temporal.composite_now && temporal.hd_late_early_frame == frame &&
+            temporal.hd_late_seen_address == entry->info.guest_address) {
+            temporal.hd_late_seen_frame = frame;
+        }
+        // PRT-GTAUTO G4 (diagnosis): every 600 frames on a late-composite screen, how it went.
+        if (cb == 0 && temporal.hd_late_seen_frame != ~u64{0} &&
+            frame - temporal.hd_late_seen_frame <= 2 &&
+            frame >= temporal.hd_gtauto_logged + 600) {
+            temporal.hd_gtauto_logged = frame;
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-GTAUTO: frame {}: late-composite screen on {:#x}: {} given to the "
+                        "presenter's DLSS at the composite, {} at the early draw (G3 {}), {} early "
+                        "scales held for the composite (G1 {}), {} scaled temporal right after, "
+                        "{} single, HD UI viewport {}",
+                        frame, temporal.hd_late_seen_address, temporal.hd_late_giveups,
+                        temporal.hd_late_early_giveups, HdUiLateGiveUp() ? "on" : "off",
+                        temporal.hd_late_deferred, HdUiLateSkipEarly() ? "on" : "off",
+                        temporal.hd_late_temporal, temporal.hd_late_single, HdUiViewport());
+        }
         // Why this draw cannot render into the proxy, or null when it can.
         if (temporal.hd_trace_frame == frame && cb == 0 && temporal.hd_trace_draws < 48) {
             const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
@@ -5301,6 +5368,25 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
                                              "natively, the proxy scales at the next display draw")
                                     : "drawn into the proxy as before (RYGT_HD_UI_LATE_SCENE off)",
                             temporal.hd_late_restarts, temporal.hd_late_missed);
+            }
+            if (restart) {
+                temporal.hd_late_seen_address = entry->info.guest_address;
+                temporal.hd_late_seen_frame = frame;
+            }
+            if (restart && HdUiLateGiveUp()) {
+                // PRT-GTAUTO G3: the picture goes back down and is given up for the frame; the
+                // composite and the interface are drawn natively, the presenter's temporal DLSS
+                // takes the display (as a menu's give_up below).
+                lock.unlock();
+                ResolveUiDisplay(entry->info.guest_address, false);
+                lock.lock();
+                ++temporal.hd_late_giveups;
+                temporal.hd_ui_scene_frame = frame;
+                proxy.phase = UiHires::Phase::Off;
+                temporal.hd_late_frame = ~u64{0};
+                temporal.hd_late_pending = false;
+                temporal.hd_late_wait_composite = false;
+                return;
             }
             if (restart) {
                 lock.unlock();
@@ -5557,6 +5643,38 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
             }
             return; // The first supported display draw remains the native scene composite.
         }
+        // PRT-GTAUTO: a screen that composited late within the last two frames (GT Auto).
+        const bool late_screen = cb == 0 && proxy.phase == UiHires::Phase::Scene &&
+                                 temporal.hd_late_seen_frame != ~u64{0} &&
+                                 frame - temporal.hd_late_seen_frame <= 2 &&
+                                 temporal.hd_late_seen_address == entry->info.guest_address;
+        if (late_screen && HdUiLateGiveUp()) {
+            // G3: given up now, before a DLSS call that its composite would undo.
+            ++temporal.hd_late_early_giveups;
+            temporal.hd_late_early_frame = frame;
+            temporal.hd_ui_scene_frame = frame;
+            proxy.phase = UiHires::Phase::Off;
+            temporal.hd_late_frame = ~u64{0};
+            temporal.hd_late_pending = false;
+            temporal.hd_late_wait_composite = false;
+            return;
+        }
+        if (late_screen && HdUiLateSkipEarly() &&
+            (temporal.frame != frame || temporal.composite_now)) {
+            // G1: this draw stays native (the composite covers it); the picture scales right
+            // after this frame's composite (ScaleAfterLateComposite).
+            ++temporal.hd_late_deferred;
+            temporal.hd_late_early_frame = frame;
+            temporal.hd_late_address = entry->info.guest_address;
+            temporal.hd_late_frame = frame;
+            temporal.hd_late_restart = true;
+            temporal.hd_late_pending = true;
+            temporal.hd_late_wait_composite = !temporal.composite_now;
+            if (temporal.composite_now) {
+                temporal.hd_late_seen_frame = frame;
+            }
+            return;
+        }
         if (proxy.phase != UiHires::Phase::Ui) {
             if (!UiHires::CreateImages(r.instance, proxy, targets.color_formats[cb])) {
                 UiHires::Unsupported(entry->info.guest_address, "color-proxy-creation", frame);
@@ -5606,6 +5724,7 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
                 inputs.mvec_scale[0] = temporal.mvec_scale[0];
                 inputs.mvec_scale[1] = temporal.mvec_scale[1];
                 inputs.reset = temporal.reset;
+                inputs.viewport = HdUiViewport(); // PRT-HDUI-VP
                 if (!inputs.depth_view || !inputs.motion_view) {
                     return std::nullopt;
                 }
@@ -14430,8 +14549,59 @@ void NativeRenderer::EvictImages() {
         std::scoped_lock lock{entry.sources_mutex};
         return entry.sources.empty();
     };
+    // PRT-VRAM (pr-tests, RYGT_DLSS_VRAM_RESERVE=<MB>, 384 by default, 0 = off): when Streamline
+    // says DLSS went over the VRAM budget, or this process uses more than the budget less this
+    // reserve, the idle textures kept past their idle time (PERF-GT7-005, up to 2 GB) are halved,
+    // at most every 300 frames, down to a sixteenth; after 3600 frames without pressure they grow
+    // back a step. On 2026-11-18 (RTX 3070 Ti laptop, budget 6342 MB) DLSS was refused from
+    // 22:33 on and temporal DLSS was gone for the rest of the session.
+    static const u64 vram_reserve = [] {
+        const char* env = std::getenv("RYGT_DLSS_VRAM_RESERVE");
+        if (env && *env) {
+            return u64{std::strtoull(env, nullptr, 10)} << 20;
+        }
+        return u64{384} << 20;
+    }();
+    static u32 vram_level = 0;
+    static u32 vram_seen_warnings = 0;
+    static u64 vram_raised_frame = 0;
+    static u64 vram_calm_frame = 0;
+    u64 effective_budget = texture_budget;
+    if (vram_reserve != 0) {
+        const u32 warnings = RytyUpscale::DlssVramWarnings().load(std::memory_order_relaxed);
+        u64 usage = 0;
+        const u64 budget = r.instance.GetTotalMemoryBudget();
+        if (r.instance.CanReportMemoryUsage()) {
+            usage = r.instance.GetDeviceMemoryUsage();
+        }
+        const bool warned = warnings != vram_seen_warnings;
+        const bool over = usage != 0 && budget != 0 && usage + vram_reserve > budget;
+        vram_seen_warnings = warnings;
+        if (warned || over) {
+            vram_calm_frame = frame;
+            if (vram_level < 4 && frame >= vram_raised_frame + 300) {
+                ++vram_level;
+                vram_raised_frame = frame;
+                LOG_WARNING(Render_Vulkan,
+                            "PRT-VRAM: frame {}: {} ({} of {} MB used, reserve {} MB); idle "
+                            "textures kept: at most {} MB now (step {} of 4)",
+                            frame, warned ? "Streamline: DLSS over the VRAM budget" : "VRAM near the budget",
+                            usage >> 20, budget >> 20, vram_reserve >> 20,
+                            (texture_budget >> vram_level) >> 20, vram_level);
+            }
+        } else if (vram_level != 0 && frame >= vram_calm_frame + 3600) {
+            --vram_level;
+            vram_calm_frame = frame;
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-VRAM: frame {}: no VRAM pressure for 3600 frames ({} of {} MB used); "
+                        "idle textures kept: at most {} MB again (step {} of 4)",
+                        frame, usage >> 20, budget >> 20, (texture_budget >> vram_level) >> 20,
+                        vram_level);
+        }
+        effective_budget = texture_budget >> vram_level;
+    }
     std::unordered_set<const Native::ImageEntry*> kept_textures;
-    if (texture_budget != 0) {
+    if (effective_budget != 0) {
         std::vector<Native::ImageEntry*> idle;
         registry->ForEachOverlapping(0, ~VAddr{0}, [&](Native::ImageEntry& entry) {
             if (entry.from_cpu && entry.image &&
@@ -14449,7 +14619,7 @@ void NativeRenderer::EvictImages() {
                 continue;
             }
             bytes += std::max<u64>(entry->info.guest_size, 1);
-            if (bytes > texture_budget) {
+            if (bytes > effective_budget) { // PRT-VRAM: texture_budget without pressure
                 break;
             }
             ++kept_at[entry->info.guest_address];

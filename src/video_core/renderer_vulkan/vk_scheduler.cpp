@@ -646,10 +646,12 @@ void Scheduler::PerfMonitorThread(std::stop_token stoken) {
         if (perf_line && sample_threads) {
             LOG_WARNING(Render_Vulkan,
                         "PRT-PERF {:.1f} s: GPU busy {:.0f}% (95%+ = GPU-bound), {} submits; "
-                        "CPU {}",
+                        "VRAM {} of {} MB; CPU {}",
                         std::chrono::duration<double>(now - line_start).count(),
                         line_samples ? line_busy * 100.0 / line_samples : 0.0, tick - line_tick,
-                        Common::SampleThreadCpuUsage(8));
+                        instance.CanReportMemoryUsage() ? instance.GetDeviceMemoryUsage() >> 20
+                                                        : u64{0},
+                        instance.GetTotalMemoryBudget() >> 20, Common::SampleThreadCpuUsage(8));
         }
         if (sample_threads) {
             line_samples = 0;

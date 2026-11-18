@@ -432,6 +432,16 @@ private:
         u64 hd_late_single = 0;       ///< scaled without them
         u32 hd_late_single_logs = 0;
         u64 hd_late_single_logged = 0;
+        /// PRT-GTAUTO (pr-tests): the last frame a late composite (GT Auto) was seen on
+        /// hd_late_seen_address, the frame its display draw was held back for it, and counts.
+        VAddr hd_late_seen_address = 0;
+        u64 hd_late_seen_frame = ~u64{0};
+        u64 hd_late_early_frame = ~u64{0};
+        bool hd_late_wait_composite = false; ///< G1: the scale waits for this frame's composite
+        u64 hd_late_giveups = 0;       ///< G3: late composites given to the presenter's DLSS
+        u64 hd_late_early_giveups = 0; ///< G3: given up at the early display draw already
+        u64 hd_late_deferred = 0;      ///< G1: early scales held back for the composite
+        u64 hd_gtauto_logged = 0;
         u64 hd_race_off_frame = ~u64{0}; ///< PRT-LATE: the last frame the race sign was off
         u64 hd_race_held_frame = ~u64{0};
         u64 hd_race_held = 0;            ///< frames the hold kept HD race off

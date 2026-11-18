@@ -3,10 +3,13 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -486,6 +489,7 @@ struct Streamline {
     PFunGetFeatureFunction get_feature_function{};
     PFunGetNewFrameToken new_frame_token{};
     PFunEvaluateFeature evaluate{};
+    PFun_slFreeResources* free_resources{}; ///< PRT-VRAM: the side viewport's DLSS, when idle
     PFun_slDLSSGSetOptions* dlssg_set_options{};
     PFun_slDLSSGGetState* dlssg_get_state{};
     int last_status = -1;
@@ -509,6 +513,7 @@ struct Streamline {
     int sr_mode = -1; // DLSSMode for sr_in -> sr_out, -1 when not supported
     bool sr_options_set{};
     bool sr_side_options_set{}; ///< pr-tests: viewport 2, single frames beside temporal ones
+    bool sr_own_options_set{};  ///< PRT-HDUI-VP: viewport 3, the HD UI picture's temporal DLSS
     // The frame token the upscaler (draw thread) started for the next presented frame; frame
     // generation's Prepare (present thread) carries on with it instead of starting another.
     // Kept apart from frame, which the present thread's markers use for the frame on screen.
@@ -531,6 +536,10 @@ std::wstring LogDir() {
 }
 
 void SlLog(sl::LogType type, const char* message) {
+    // PRT-VRAM (pr-tests): counted, so the native renderer frees idle textures (EvictImages).
+    if (message && std::string_view{message}.find("Exceeded VRAM budget") != std::string_view::npos) {
+        RytyUpscale::DlssVramWarnings().fetch_add(1, std::memory_order_relaxed);
+    }
     if (type == sl::LogType::eError) {
         LOG_ERROR(Render_Vulkan, "Streamline: {}", message ? message : "");
     } else if (type == sl::LogType::eWarn) {
@@ -762,6 +771,7 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
         reinterpret_cast<PFunGetFeatureFunction>(get("slGetFeatureFunction"));
     g_sl.new_frame_token = reinterpret_cast<PFunGetNewFrameToken>(get("slGetNewFrameToken"));
     g_sl.evaluate = reinterpret_cast<PFunEvaluateFeature>(get("slEvaluateFeature"));
+    g_sl.free_resources = reinterpret_cast<PFun_slFreeResources*>(get("slFreeResources"));
     const auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(get("vkGetInstanceProcAddr"));
     if (!g_sl.init || !g_sl.set_tag || !g_sl.set_constants || !g_sl.get_feature_function ||
         !g_sl.new_frame_token || !g_sl.evaluate || !gipa) {
@@ -1021,6 +1031,7 @@ bool UpscaleSupports(vk::Extent2D input, vk::Extent2D output) {
         g_sl.sr_mode = FindMode(input, output);
         g_sl.sr_options_set = false;
         g_sl.sr_side_options_set = false;
+        g_sl.sr_own_options_set = false;
         LOG_WARNING(Render_Vulkan, "ryGT DLSS: {}x{} to {}x{}: {}", input.width, input.height,
                     output.width, output.height,
                     g_sl.sr_mode < 0 ? std::string{"no DLSS mode fits; using FSR"}
@@ -1056,6 +1067,23 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     const bool use_temporal = temporal && !temporal_refused && !temporal_paused &&
                               temporal->size == input_size &&
                               temporal->depth_view && temporal->motion_view;
+    // PRT-HDUI-VP (pr-tests, RYGT_HD_UI_OWN_VIEWPORT=1): the HD UI picture's temporal DLSS runs on
+    // a viewport of its own, with its own history, and leaves the presenter's counts and status
+    // alone.
+    const bool own = use_temporal && temporal->viewport != 0;
+    static bool own_last_temporal = false;
+    // PRT-DLSS-STATS (pr-tests): every 600 calls, what DLSS ran (G4).
+    static u64 stat_side = 0, stat_own = 0, stat_temporal = 0, stat_single = 0, stat_failed = 0,
+               stat_resets = 0, stat_refused = 0;
+    if (calls % 600 == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-DLSS-STATS: {} calls: {} temporal, {} single, {} side viewport, {} HD UI "
+                    "viewport, {} history resets, {} failed, {} temporal refused (VRAM warnings "
+                    "{})",
+                    calls, stat_temporal, stat_single, stat_side, stat_own, stat_resets,
+                    stat_failed, stat_refused,
+                    RytyUpscale::DlssVramWarnings().load(std::memory_order_relaxed));
+    }
     // pr-tests: a single frame asked for right after a temporal one (with GPU.hd_ui a menu with a
     // 3D scene asked DLSS for both, turn about, every frame) runs on DLSS's second viewport: on
     // the first it reset the temporal history every frame (the 3D shook) and flipped the
@@ -1067,11 +1095,35 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     }();
     static u64 last_temporal_call = 0;
     static u64 side_frames = 0;
+    static u64 last_side_call = 0;
     const bool side = side_wanted && !use_temporal && last_temporal && !temporal_refused &&
                       RytyUpscale::TemporalRequested() && last_temporal_call != 0 &&
                       calls - last_temporal_call <= 3;
-    const sl::ViewportHandle viewport{side ? 2u : 1u};
-    bool& options_set = side ? g_sl.sr_side_options_set : g_sl.sr_options_set;
+    // PRT-VRAM (pr-tests, RYGT_DLSS_FREE_SIDE=0 turns it off): the side viewport's DLSS memory is
+    // freed once it has not run for 600 calls (~5-10 s, long after the GPU finished with it);
+    // its next use sets it up again.
+    static const bool free_side = [] {
+        const char* env = std::getenv("RYGT_DLSS_FREE_SIDE");
+        return !(env && env[0] == '0');
+    }();
+    if (side) {
+        last_side_call = calls;
+    } else if (free_side && g_sl.free_resources && g_sl.sr_side_options_set &&
+               last_side_call != 0 && calls - last_side_call > 600) {
+        const sl::Result freed = g_sl.free_resources(sl::kFeatureDLSS, sl::ViewportHandle{2u});
+        g_sl.sr_side_options_set = false;
+        last_side_call = 0;
+        static u32 free_logs = 0;
+        if (free_logs++ < 16) {
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-VRAM: DLSS's side viewport idle for 600 calls: its memory freed "
+                        "(result {})",
+                        static_cast<int>(freed));
+        }
+    }
+    const sl::ViewportHandle viewport{own ? temporal->viewport : (side ? 2u : 1u)};
+    bool& options_set =
+        own ? g_sl.sr_own_options_set : (side ? g_sl.sr_side_options_set : g_sl.sr_options_set);
     if (!options_set) {
         sl::DLSSOptions options{};
         options.mode = static_cast<sl::DLSSMode>(g_sl.sr_mode);
@@ -1109,7 +1161,8 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
             RytyUpscale::TemporalFactors("RYGT_DLSS_TEMPORAL_MVEC", &f[2]);
             return f;
         }();
-        const bool reset = t->reset || !last_temporal;
+        const bool reset = t->reset || !(own ? own_last_temporal : last_temporal);
+        stat_resets += reset ? 1 : 0;
         constants.jitterOffset =
             sl::float2(t->jitter[0] * factors[0], t->jitter[1] * factors[1]);
         constants.mvecScale =
@@ -1199,31 +1252,56 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     }
     return true;
     };
+    // PRT-VRAM (pr-tests, RYGT_DLSS_RETRY_CALLS=<calls>, 120 by default, about 1-2 s): after a
+    // refusal the temporal inputs are tried again after this many calls (600 before), and never
+    // longer than five times it (3600 before), so temporal DLSS comes back as soon as the native
+    // renderer has freed memory (EvictImages).
+    static const u64 retry_calls = [] {
+        const char* env = std::getenv("RYGT_DLSS_RETRY_CALLS");
+        if (env && *env) {
+            return std::max<u64>(u64{std::strtoull(env, nullptr, 10)}, 1);
+        }
+        return u64{120};
+    }();
     bool ok = false;
     if (use_temporal) {
         ok = run(temporal);
         if (!ok) {
-            if (++temporal_refusals >= 8) {
-                temporal_retry_at = calls + 3600; // FIX-PRT-DLSS: never for the rest of the run
-                LOG_ERROR(Render_Vulkan, "DLSS-GT7-001: the temporal inputs were refused {} "
-                                         "times; single frames for ~3600 frames, then temporal again",
-                          temporal_refusals);
-            } else {
-                temporal_retry_at = calls + 600;
-                LOG_ERROR(Render_Vulkan, "DLSS-GT7-001: the temporal inputs were refused ({} of 8); "
-                                         "single frames for ~600 frames, then temporal again",
-                          temporal_refusals);
+            ++stat_refused;
+            ++temporal_refusals;
+            const u64 pause = temporal_refusals >= 8 ? retry_calls * 5 : retry_calls;
+            temporal_retry_at = calls + pause;
+            static u32 refusal_logs = 0;
+            if (refusal_logs++ < 64) {
+                LOG_ERROR(Render_Vulkan,
+                          "DLSS-GT7-001: the temporal inputs were refused ({} so far); single "
+                          "frames for ~{} calls, then temporal again (PRT-VRAM)",
+                          temporal_refusals, pause);
             }
+        } else if (!own) {
+            temporal_refusals = 0;
         }
     }
     const bool ran_temporal = ok;
     if (!ok) {
         ok = run(nullptr);
     }
+    if (!ok) {
+        ++stat_failed;
+    }
+    if (own) {
+        // PRT-HDUI-VP: the HD UI viewport keeps its own history state only.
+        if (ok) {
+            ++stat_own;
+            own_last_temporal = ran_temporal;
+        }
+        return ok;
+    }
     if (ran_temporal) {
         last_temporal_call = calls;
     }
     if (ok && side) {
+        ++stat_side;
         // Beside the temporal frames: their history, counts and status stay as they are.
         if (side_frames++ % 600 == 0) {
             LOG_WARNING(Render_Vulkan,
@@ -1242,6 +1320,7 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
                         temporal_frames, flat_frames);
         }
         ++(ran_temporal ? temporal_frames : flat_frames);
+        ++(ran_temporal ? stat_temporal : stat_single);
         last_temporal = ran_temporal;
         RytyUpscale::TemporalStatus().store(ran_temporal ? 1 : 0, std::memory_order_relaxed);
         if (ran_temporal) {
@@ -1278,6 +1357,7 @@ void Shutdown() {
     g_sl.sr_mode = -1;
     g_sl.sr_options_set = false;
     g_sl.sr_side_options_set = false;
+    g_sl.sr_own_options_set = false;
 }
 
 } // namespace Vulkan::RytyDlssG

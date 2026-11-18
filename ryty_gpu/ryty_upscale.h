@@ -146,6 +146,10 @@ struct TemporalInputs {
     /// A menu frame whose interface went through DLSS: the display as it was before its interface
     /// (same view as the display's), so the motion pass finds where the interface drew. Else null.
     vk::ImageView ui_scene_view;
+    /// PRT-HDUI-VP (pr-tests, RYGT_HD_UI_OWN_VIEWPORT=1): the Streamline viewport the HD UI
+    /// picture's temporal DLSS runs on, apart from the presenter's (1) and the side one (2);
+    /// 0 = the usual viewport.
+    unsigned viewport = 0;
 };
 
 /// DLSS-GT7-004: temporal DLSS is what NVIDIA DLSS means by default. It is asked for when
@@ -220,6 +224,13 @@ inline std::atomic<int>& TemporalStatus() {
 }
 
 /// The prototype is requested, not switched off with its key, and DLSS can take its inputs.
+/// PRT-VRAM (pr-tests): how many times Streamline said DLSS went over the VRAM budget; the native
+/// renderer frees idle textures when it rises (EvictImages).
+inline std::atomic<unsigned>& DlssVramWarnings() {
+    static std::atomic<unsigned> warnings{0};
+    return warnings;
+}
+
 inline bool TemporalActive() {
     return TemporalRequested() && TemporalSwitch().load(std::memory_order_relaxed) &&
            TemporalUsable().load(std::memory_order_relaxed);
