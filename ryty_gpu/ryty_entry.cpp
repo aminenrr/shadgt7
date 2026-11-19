@@ -332,11 +332,11 @@ void DrawBootShaderProgress() {
 
 // What the watermark says: this renderer's revision, after the prerelease's name when this is
 // that prerelease's renderer (manifest.json beside the exe has its commit; a test renderer copied
-// into a release leaves the release's manifest there). Empty in a tagged release, or with
-// RYGT_WATERMARK=0.
+// into a release leaves the release's manifest there). Empty in a tagged release, and since
+// Build B4 (pr-tests) unless RYGT_WATERMARK=1 (the launcher's "Show the build watermark").
 std::string BuildWatermark() {
     const char* env = std::getenv("RYGT_WATERMARK");
-    if (Common::g_is_release || (env && env[0] == '0')) {
+    if (Common::g_is_release || !(env && env[0] == '1')) {
         return {};
     }
     const std::string revision = Common::g_scm_desc;

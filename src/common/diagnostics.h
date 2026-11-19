@@ -27,4 +27,15 @@ constexpr const char* DiagEnv(const char*) {
 }
 #endif
 
+/// PRT-LOGS (Build B4, pr-tests): the old routine log lines (each pipeline built, per-texture
+/// overlap notes, the every-2-s perf lines of past investigations) only with RYGT_LOG_VERBOSE=1.
+/// Read once; the launcher's "Verbose logs" toggle sets it. Off by default.
+inline bool VerboseLogs() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_LOG_VERBOSE");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
 } // namespace Common

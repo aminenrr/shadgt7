@@ -39,6 +39,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "common/diagnostics.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -1336,17 +1337,19 @@ GraphicsPipeline::GraphicsPipeline(
                    vk::to_string(link_result));
         pipeline = std::move(linked);
         SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
-        LOG_WARNING(
-            Render_Vulkan,
-            "Graphics pipeline {}: libraries {:.1f} ms (pre-raster {}, fragment {}), fast "
-            "link {:.1f} ms; PERF-GT7-041 shared waits {}",
-            debug_str,
-            std::chrono::duration<double, std::milli>(libraries_done - create_start).count(),
-            pre_raster_reused ? "reused" : "compiled", fragment_reused ? "reused" : "compiled",
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                      libraries_done)
-                .count(),
-            library_cache.shared_waits.load());
+        if (::Common::VerboseLogs()) { // PRT-LOGS (Build B4)
+            LOG_WARNING(
+                Render_Vulkan,
+                "Graphics pipeline {}: libraries {:.1f} ms (pre-raster {}, fragment {}), fast "
+                "link {:.1f} ms; PERF-GT7-041 shared waits {}",
+                debug_str,
+                std::chrono::duration<double, std::milli>(libraries_done - create_start).count(),
+                pre_raster_reused ? "reused" : "compiled", fragment_reused ? "reused" : "compiled",
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                          libraries_done)
+                    .count(),
+                library_cache.shared_waits.load());
+        }
 
         if (!lto_relink) {
             return; // SHD-001: the fast-linked pipeline is the one drawn with

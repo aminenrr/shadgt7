@@ -1223,13 +1223,15 @@ void Liverpool::ReportDrawPipe() {
             flushes, wait_us / 1000.0, wait_us / 1000.0 / flushes,
             fault_flush_max_us.exchange(0) / 1000.0);
     }
-    LOG_WARNING(Render,
-                "PERF-031 draw pipe in {:.1f} s: {} jobs, recorder busy {:.0f}%, max queued {}, "
-                "{} full-queue waits; {} waits moved to the recorder; drains {} ({} waited, "
-                "{:.1f} ms):{}{}",
-                seconds, stats.pushed, stats.recorder_busy_us / (seconds * 1e4), stats.max_queued,
-                stats.push_waits, waits_moved, stats.drains, stats.drains_that_waited,
-                stats.drain_wait_us / 1000.0, reasons, read_ahead);
+    if (::Common::VerboseLogs()) { // PRT-LOGS (Build B4)
+        LOG_WARNING(Render,
+                    "PERF-031 draw pipe in {:.1f} s: {} jobs, recorder busy {:.0f}%, max queued {}, "
+                    "{} full-queue waits; {} waits moved to the recorder; drains {} ({} waited, "
+                    "{:.1f} ms):{}{}",
+                    seconds, stats.pushed, stats.recorder_busy_us / (seconds * 1e4), stats.max_queued,
+                    stats.push_waits, waits_moved, stats.drains, stats.drains_that_waited,
+                    stats.drain_wait_us / 1000.0, reasons, read_ahead);
+    }
     if (draw_pipe->HasStage()) {
         LOG_WARNING(Render,
                     "PERF-067 buffer stage in {:.1f} s: {} draws prepared ahead, {} waits for the "

@@ -1126,14 +1126,16 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
     const auto now = std::chrono::steady_clock::now();
     if (now - stats.since >= std::chrono::seconds{2}) {
         if (stats.ahead + stats.compute_ahead + stats.mismatched + stats.recorder != 0) {
-            LOG_WARNING(Render_Vulkan,
-                        "PERF-047 pipelines in {:.1f} s: {} selected on the command thread "
-                        "(PERF-055: {} of them compute), {} selected again here (memory "
-                        "changed), {} selected here (quad lists, indirect draws); {} checked "
-                        "against a selection here, {} differed",
-                        std::chrono::duration<double>(now - stats.since).count(),
-                        stats.ahead + stats.compute_ahead, stats.compute_ahead, stats.mismatched,
-                        stats.recorder, stats.verified, stats.verify_failed);
+            if (::Common::VerboseLogs()) { // PRT-LOGS (Build B4)
+                LOG_WARNING(Render_Vulkan,
+                            "PERF-047 pipelines in {:.1f} s: {} selected on the command thread "
+                            "(PERF-055: {} of them compute), {} selected again here (memory "
+                            "changed), {} selected here (quad lists, indirect draws); {} checked "
+                            "against a selection here, {} differed",
+                            std::chrono::duration<double>(now - stats.since).count(),
+                            stats.ahead + stats.compute_ahead, stats.compute_ahead, stats.mismatched,
+                            stats.recorder, stats.verified, stats.verify_failed);
+            }
         }
         if (plan_stats.used + plan_stats.redone + plan_stats.mismatched != 0) {
             LOG_WARNING(Render_Vulkan,
@@ -3735,14 +3737,16 @@ void Rasterizer::RecordDeferredFenceLatency(std::chrono::steady_clock::time_poin
     stats.max_us = std::max(stats.max_us, latency_us);
     if (now - stats.window_start >= std::chrono::seconds{2}) {
         const u64 frames = u64(DebugState.GetFrameNum()) - stats.window_frame;
-        LOG_WARNING(
-            Render_Vulkan,
-            "Deferred fences: {} in {} frames, latency avg {:.2f} ms max {:.2f} ms; DIAG-068: "
-            "deferred for image readbacks {}, same address {}, behind an earlier one {}; FIX-070: "
-            "{} small readbacks without a fence; D5: {} without a submit of their own",
-            stats.count, frames, stats.total_us / 1000.0 / stats.count, stats.max_us / 1000.0,
-            g_defer_readbacks.exchange(0), g_defer_address.exchange(0), g_defer_order.exchange(0),
-            background_readbacks.exchange(0), g_defer_unflushed.exchange(0));
+        if (::Common::VerboseLogs()) { // PRT-LOGS (Build B4)
+            LOG_WARNING(
+                Render_Vulkan,
+                "Deferred fences: {} in {} frames, latency avg {:.2f} ms max {:.2f} ms; DIAG-068: "
+                "deferred for image readbacks {}, same address {}, behind an earlier one {}; FIX-070: "
+                "{} small readbacks without a fence; D5: {} without a submit of their own",
+                stats.count, frames, stats.total_us / 1000.0 / stats.count, stats.max_us / 1000.0,
+                g_defer_readbacks.exchange(0), g_defer_address.exchange(0), g_defer_order.exchange(0),
+                background_readbacks.exchange(0), g_defer_unflushed.exchange(0));
+        }
         stats = {};
         stats.window_start = now;
         stats.window_frame = u64(DebugState.GetFrameNum());

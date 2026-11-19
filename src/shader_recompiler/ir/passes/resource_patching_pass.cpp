@@ -15,6 +15,7 @@
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/amdgpu/resource.h"
+#include "common/diagnostics.h"
 
 namespace Shader::Optimization {
 namespace {
@@ -333,10 +334,12 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
         if (FMaskKeyEnabled() || size_read) {
             const u32 index = descriptors.Add(fmask_res);
             info.fmasks[index].size_read |= size_read;
-            LOG_WARNING(Render_Recompiler,
-                        "FIX-GT7-043: program {:#x}: the T# at {} ({:#x}) is an FMask, its reads are "
-                        "constants",
-                        info.pgm_hash, image_res.sharp_fetch.offsets[0], image.Address());
+            if (::Common::VerboseLogs()) { // PRT-LOGS (Build B4)
+                LOG_WARNING(Render_Recompiler,
+                            "FIX-GT7-043: program {:#x}: the T# at {} ({:#x}) is an FMask, its reads are "
+                            "constants",
+                            info.pgm_hash, image_res.sharp_fetch.offsets[0], image.Address());
+            }
         }
 
         IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};

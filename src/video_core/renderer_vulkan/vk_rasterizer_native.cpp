@@ -407,7 +407,7 @@ bool NativeModeRequested() {
 }
 
 namespace {
-// PRT-JITTER (pr-tests, log only, RYGT_PRT_JITTER=0 turns it off): GT Auto still looks aliased
+// PRT-JITTER (pr-tests, log only, off since Build B4, RYGT_PRT_JITTER=1 turns it on): GT Auto still looks aliased
 // inside the menu temporal DLSS (Build B, 2026-11-19). Every 600 menu frames that ran temporal DLSS
 // with HD UI: jitter min/max, frames with zero jitter, frames whose jitter equals the frame
 // before (a stuck jitter gives DLSS nothing to resolve), the motion vector scale range and the
@@ -415,7 +415,7 @@ namespace {
 bool PrtJitterOn() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_PRT_JITTER");
-        return !(env && env[0] == '0');
+        return env && env[0] == '1';
     }();
     return on;
 }
@@ -5504,17 +5504,19 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
         // Why this draw cannot render into the proxy, or null when it can.
         if (temporal.hd_trace_frame == frame && cb == 0 && temporal.hd_trace_draws < 48) {
             const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
-            LOG_WARNING(Render_Vulkan,
-                        "HDUI-TRACE: frame {} draw {} into {:#x}: phase {}, ps {:#x}, depth {:#x}"
-                        "{}",
-                        frame, temporal.hd_trace_draws++, entry->info.guest_address,
-                        static_cast<int>(proxy.phase), fs ? fs->pgm_hash : 0,
-                        targets.depth ? targets.depth->info.guest_address : 0,
-                        targets.depth && temporal.depth &&
-                                targets.depth->info.guest_address ==
-                                    temporal.depth->info.guest_address
-                            ? " (the scene's depth)"
-                            : "");
+            if (::Common::VerboseLogs()) { // PRT-LOGS (Build B4)
+                LOG_WARNING(Render_Vulkan,
+                            "HDUI-TRACE: frame {} draw {} into {:#x}: phase {}, ps {:#x}, depth {:#x}"
+                            "{}",
+                            frame, temporal.hd_trace_draws++, entry->info.guest_address,
+                            static_cast<int>(proxy.phase), fs ? fs->pgm_hash : 0,
+                            targets.depth ? targets.depth->info.guest_address : 0,
+                            targets.depth && temporal.depth &&
+                                    targets.depth->info.guest_address ==
+                                        temporal.depth->info.guest_address
+                                ? " (the scene's depth)"
+                                : "");
+            }
         }
         // pr-tests HDUI late scene: the composite found the proxy already scaled this frame.
         if (cb == 0 && temporal.composite_now && proxy.phase == UiHires::Phase::Ui) {
@@ -12129,7 +12131,17 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
     // From here the result is replaced: only then are the frame's jitter and pictures handed to
     // DLSS (a resolved picture given with a jitter would be shifted back and forth by DLSS).
     if (temporal.frame != frame) {
-        temporal.reset = temporal.frame + 1 != frame;
+        // PRT-GAP (Build B4, pr-tests, RYGT_DLSS_GAP_NO_RESET=n, off): GT Auto skips the temporal
+        // pass on a single frame now and then (4 to 14 times in 10 s); each restarted DLSS's
+        // history, and the next frames came out aliased. With n set, a gap of up to n frames
+        // without a pass keeps the history (n from 1 to 8).
+        static const u64 gap_kept = [] {
+            const char* env = std::getenv("RYGT_DLSS_GAP_NO_RESET");
+            const int n = env ? std::atoi(env) : 0;
+            return static_cast<u64>(std::clamp(n, 0, 8));
+        }();
+        temporal.reset = temporal.frame == ~u64{0} || frame < temporal.frame ||
+                         frame - temporal.frame > 1 + gap_kept;
         g_prt_gap = frame - temporal.frame; // PRT-JITTER v2
     }
     g_prt_raw_x = c[20];

@@ -562,19 +562,21 @@ void BufferCache::LogHotPageStats() {
                            stat->faults, stat->last_offset, stat->last_size,
                            stat->touches_gpu_bytes ? "touches them" : "page only", stat->gpu_bytes);
     }
-    LOG_WARNING(Render_Vulkan,
-                "Readback pages in 2.0 s: {} CPU faults ({} only share a page with GPU writes, "
-                "{} handled without a drain, {} beside GDS copies, {} GPU ranges then written "
-                "by the CPU), {} new pages ({} tracked), {} readbacks ({} KB), {} completed, {} "
-                "superseded; FIX-066: {} uploads over GPU-written bytes; FIX-069: {} parts kept by the "
-                "CPU; FIX-073: {} parts the CPU rewrote unseen, {} unseen CPU bytes sent to the "
-                "GPU;{}",
-                stats.faults, stats.page_only_faults, stats.split_faults, stats.gds_split_faults,
-                stats.cpu_overwrote.exchange(0), stats.new_pages, hot_page_order.size(),
-                stats.recorded, stats.recorded_bytes / 1024, stats.completed.exchange(0),
-                stats.invalidated.exchange(0), stats.uploads_over_gpu_bytes.load(),
-                std::exchange(writebacks_cpu_newer, 0), std::exchange(readbacks_cpu_rewrote, 0),
-                std::exchange(unseen_cpu_bytes_synced, 0), top);
+    if (::Common::VerboseLogs()) { // PRT-LOGS (Build B4)
+        LOG_WARNING(Render_Vulkan,
+                    "Readback pages in 2.0 s: {} CPU faults ({} only share a page with GPU writes, "
+                    "{} handled without a drain, {} beside GDS copies, {} GPU ranges then written "
+                    "by the CPU), {} new pages ({} tracked), {} readbacks ({} KB), {} completed, {} "
+                    "superseded; FIX-066: {} uploads over GPU-written bytes; FIX-069: {} parts kept by the "
+                    "CPU; FIX-073: {} parts the CPU rewrote unseen, {} unseen CPU bytes sent to the "
+                    "GPU;{}",
+                    stats.faults, stats.page_only_faults, stats.split_faults, stats.gds_split_faults,
+                    stats.cpu_overwrote.exchange(0), stats.new_pages, hot_page_order.size(),
+                    stats.recorded, stats.recorded_bytes / 1024, stats.completed.exchange(0),
+                    stats.invalidated.exchange(0), stats.uploads_over_gpu_bytes.load(),
+                    std::exchange(writebacks_cpu_newer, 0), std::exchange(readbacks_cpu_rewrote, 0),
+                    std::exchange(unseen_cpu_bytes_synced, 0), top);
+    }
     if (auto& sync = image_sync_stats; sync.calls != 0) {
         const u64 generation = texture_cache.RegistryGeneration();
         LOG_WARNING(Render_Vulkan,

@@ -16,6 +16,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "ryty_gpu/ryty_upscale.h"
+#include "common/diagnostics.h"
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
@@ -207,11 +208,13 @@ void CountTranslation(const Shader::Info& info, const Shader::StageSpecializatio
         for (size_t i = 0; i < std::min<size_t>(top.size(), 14); ++i) {
             text += fmt::format(" {}={}", top[i].second, top[i].first);
         }
-        LOG_WARNING(Render_Vulkan,
-                    "SHD-006 census: {} new translations; pixel {} ({} from code alone), vertex {} "
-                    "({} from code alone), other {}; needed:{}",
-                    g_census.total, g_census.ps, g_census.ps_default, g_census.vs,
-                    g_census.vs_default, g_census.other, text);
+        if (::Common::VerboseLogs()) { // PRT-LOGS (Build B4)
+            LOG_WARNING(Render_Vulkan,
+                        "SHD-006 census: {} new translations; pixel {} ({} from code alone), vertex {} "
+                        "({} from code alone), other {}; needed:{}",
+                        g_census.total, g_census.ps, g_census.ps_default, g_census.vs,
+                        g_census.vs_default, g_census.other, text);
+        }
     }
 }
 } // namespace

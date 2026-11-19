@@ -1163,15 +1163,17 @@ void ImageRegistry::LinkTexture(ImageEntry& texture) {
                             u64(b.resources.levels);
             std::scoped_lock log_lock{overlap_log_mutex};
             if (overlap_logged.size() < 4096 && overlap_logged.insert(key).second) {
-                LOG_WARNING(Render_Vulkan,
-                            "NAT-041: texture {:#x}+{:#x} {}x{} mips {} layers {} tile {} {} bits "
-                            "over render target {:#x}+{:#x} {}x{} mips {} layers {} tile {} {} "
-                            "bits{}",
-                            a.guest_address, a.guest_size, a.size.width, a.size.height,
-                            a.resources.levels, a.resources.layers, u32(a.tile_mode), a.num_bits,
-                            b.guest_address, b.guest_size, b.size.width, b.size.height,
-                            b.resources.levels, b.resources.layers, u32(b.tile_mode), b.num_bits,
-                            b.props.is_depth ? " (depth)" : "");
+                if (::Common::VerboseLogs()) { // PRT-LOGS (Build B4)
+                    LOG_WARNING(Render_Vulkan,
+                                "NAT-041: texture {:#x}+{:#x} {}x{} mips {} layers {} tile {} {} bits "
+                                "over render target {:#x}+{:#x} {}x{} mips {} layers {} tile {} {} "
+                                "bits{}",
+                                a.guest_address, a.guest_size, a.size.width, a.size.height,
+                                a.resources.levels, a.resources.layers, u32(a.tile_mode), a.num_bits,
+                                b.guest_address, b.guest_size, b.size.width, b.size.height,
+                                b.resources.levels, b.resources.layers, u32(b.tile_mode), b.num_bits,
+                                b.props.is_depth ? " (depth)" : "");
+                }
             }
         }
     });

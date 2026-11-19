@@ -17,6 +17,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "ryty_gpu/ryty_diag.h"
+#include "common/diagnostics.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
@@ -330,14 +331,16 @@ void ReportFlipStats() {
     if (now - s.window < std::chrono::seconds{2}) {
         return;
     }
-    LOG_WARNING(Lib_VideoOut,
-                "Flips in {:.1f} s: {} flips, {} vblanks ({} with no flip ready), max queued {}, "
-                "submit-to-flip avg {:.2f} ms max {:.2f} ms, Present avg {:.2f} ms max {:.2f} ms; "
-                "PERF-111: {} submits paced, avg wait {:.2f} ms, {} timeouts",
-                std::chrono::duration<double>(now - s.window).count(), s.flips, s.vblanks,
-                s.idle_vblanks, s.max_queue, s.flips ? s.latency_ms / s.flips : 0.0,
-                s.max_latency_ms, s.flips ? s.present_ms / s.flips : 0.0, s.max_present_ms,
-                s.paced, s.paced ? s.paced_ms / s.paced : 0.0, s.pace_timeouts);
+    if (::Common::VerboseLogs()) { // PRT-LOGS (Build B4)
+        LOG_WARNING(Lib_VideoOut,
+                    "Flips in {:.1f} s: {} flips, {} vblanks ({} with no flip ready), max queued {}, "
+                    "submit-to-flip avg {:.2f} ms max {:.2f} ms, Present avg {:.2f} ms max {:.2f} ms; "
+                    "PERF-111: {} submits paced, avg wait {:.2f} ms, {} timeouts",
+                    std::chrono::duration<double>(now - s.window).count(), s.flips, s.vblanks,
+                    s.idle_vblanks, s.max_queue, s.flips ? s.latency_ms / s.flips : 0.0,
+                    s.max_latency_ms, s.flips ? s.present_ms / s.flips : 0.0, s.max_present_ms,
+                    s.paced, s.paced ? s.paced_ms / s.paced : 0.0, s.pace_timeouts);
+    }
     s.flips = s.vblanks = s.idle_vblanks = s.max_queue = 0;
     s.latency_ms = s.max_latency_ms = s.present_ms = s.max_present_ms = 0;
     s.paced = s.pace_timeouts = 0;

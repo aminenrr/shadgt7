@@ -20,6 +20,7 @@
 #include "video_core/amdgpu/draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "ryty_gpu/ryty_diag.h"
+#include "common/diagnostics.h"
 
 namespace Vulkan {
 
@@ -377,7 +378,9 @@ static void NoteFlush(const std::source_location& loc) {
         for (const auto& [site, count] : sites) {
             text += fmt::format(" {}:{}={}", site.first, site.second, count);
         }
-        LOG_WARNING(Render_Vulkan, "DIAG-118: submits in 2 s by caller:{}", text);
+        if (::Common::VerboseLogs()) { // PRT-LOGS (Build B4)
+            LOG_WARNING(Render_Vulkan, "DIAG-118: submits in 2 s by caller:{}", text);
+        }
         sites.clear();
         since = now;
     }

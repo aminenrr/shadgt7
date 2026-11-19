@@ -35,6 +35,7 @@
 #include "imgui/friends_layer.h"
 #include "imgui/invitation_prompt_layer.h"
 #include "imgui/shadnet_notifications_layer.h"
+#include "common/diagnostics.h"
 
 namespace {
 
@@ -356,12 +357,14 @@ void ReportAreaStats() {
     if (now - last < 2000 || !g_area_stats.last_report.compare_exchange_strong(last, now)) {
         return;
     }
-    LOG_WARNING(Render_Vulkan,
-                "Mapping lookups in 2 s: {} lookups, {} cache hits, {} unmapped, {} region queries, "
-                "{} map changes, {} answers not kept",
-                g_area_stats.lookups.exchange(0), g_area_stats.hits.exchange(0),
-                g_area_stats.unmapped.exchange(0), g_area_stats.queries.exchange(0),
-                g_area_stats.changes.exchange(0), g_area_stats.stores_skipped.exchange(0));
+    if (::Common::VerboseLogs()) { // PRT-LOGS (Build B4)
+        LOG_WARNING(Render_Vulkan,
+                    "Mapping lookups in 2 s: {} lookups, {} cache hits, {} unmapped, {} region queries, "
+                    "{} map changes, {} answers not kept",
+                    g_area_stats.lookups.exchange(0), g_area_stats.hits.exchange(0),
+                    g_area_stats.unmapped.exchange(0), g_area_stats.queries.exchange(0),
+                    g_area_stats.changes.exchange(0), g_area_stats.stores_skipped.exchange(0));
+    }
 }
 
 // Walks committed regions from end (the end of a committed region) towards limit, jumping over

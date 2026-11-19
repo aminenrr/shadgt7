@@ -6142,24 +6142,28 @@ static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool*
             const auto dump = liverpool ? liverpool->FindRecentConstDump(base, sizeof(c))
                                         : std::nullopt;
             const auto rec = AmdGpu::Liverpool::FindTessSubmit(base);
-            LOG_WARNING(Render_Vulkan, "DIAG-059: sane constants {}: {}; DIAG-061: {} at "
-                                       "submission {}, decoding {} of {}; DIAG-066: {}",
-                        n,
-                        dump ? fmt::format("CE dump {} of {}", dump->sequence,
-                                           liverpool->ConstDumpSequence())
-                             : std::string("not from a recent CE dump"),
-                        rec ? (rec->sane ? "sane" : "garbage") : "unseen", rec ? rec->submit : 0,
-                        liverpool ? liverpool->DecodingSubmit() : 0,
-                        liverpool ? liverpool->SubmittedCount() : 0,
-                        AmdGpu::Liverpool::DescribeEops());
-            LOG_WARNING(Render_Vulkan,
-                        "DIAG-059: sane tessellation constants {} of hs {:#x} at {:#x}: ls stride "
-                        "{:#x}, cp stride {:#x}, patches {:#x}, output base {:#x}, patch output "
-                        "size {:#x}; V# {:08x} {:08x} {:08x} {:08x}",
-                        n, hull.pgm_hash, base, c.ls_stride, c.hs_cp_stride, c.num_patches,
-                        c.hs_output_base, c.patch_output_size,
-                        reinterpret_cast<const u32*>(&buf)[0], reinterpret_cast<const u32*>(&buf)[1],
-                        reinterpret_cast<const u32*>(&buf)[2], reinterpret_cast<const u32*>(&buf)[3]);
+            if (::Common::VerboseLogs()) { // PRT-LOGS (Build B4)
+                LOG_WARNING(Render_Vulkan, "DIAG-059: sane constants {}: {}; DIAG-061: {} at "
+                                           "submission {}, decoding {} of {}; DIAG-066: {}",
+                            n,
+                            dump ? fmt::format("CE dump {} of {}", dump->sequence,
+                                               liverpool->ConstDumpSequence())
+                                 : std::string("not from a recent CE dump"),
+                            rec ? (rec->sane ? "sane" : "garbage") : "unseen", rec ? rec->submit : 0,
+                            liverpool ? liverpool->DecodingSubmit() : 0,
+                            liverpool ? liverpool->SubmittedCount() : 0,
+                            AmdGpu::Liverpool::DescribeEops());
+            }
+            if (::Common::VerboseLogs()) { // PRT-LOGS (Build B4)
+                LOG_WARNING(Render_Vulkan,
+                            "DIAG-059: sane tessellation constants {} of hs {:#x} at {:#x}: ls stride "
+                            "{:#x}, cp stride {:#x}, patches {:#x}, output base {:#x}, patch output "
+                            "size {:#x}; V# {:08x} {:08x} {:08x} {:08x}",
+                            n, hull.pgm_hash, base, c.ls_stride, c.hs_cp_stride, c.num_patches,
+                            c.hs_output_base, c.patch_output_size,
+                            reinterpret_cast<const u32*>(&buf)[0], reinterpret_cast<const u32*>(&buf)[1],
+                            reinterpret_cast<const u32*>(&buf)[2], reinterpret_cast<const u32*>(&buf)[3]);
+            }
         }
     }
     if (!sane) {
