@@ -169,6 +169,194 @@ static bool ManifestRecordOn() {
     }();
     return on;
 }
+
+// PRT-KEYNORM (pr-tests, RYGT_PIPELINE_KEY_NORMALIZE=0 turns it off): state the pipeline build
+// never reads is cleared from the key, so a draw and a recorded pipeline (PRT-PREWARM) that differ
+// only there get the same pipeline. From the owner's PRT-KEEP lines (2026-11-18), with the key's
+// layout (color_buffers at 184, blend_controls at 280, 12 + 4 bytes a target):
+//  - colour targets past num_color_attachments: the first pass of RefreshGraphicsKey fills
+//    color_buffers for every bound target, before the pixel shader's MRT mask is known; the
+//    pipeline only reads the first num_color_attachments (e.g. miss 14, bytes 208..229, targets
+//    2 and 3 only);
+//  - BlendControl is copied whole from the register: its alpha factors and function are read
+//    only with separate_alpha_blend, and its unnamed bits and disable_rop3 never.
+// The rest of those near-misses differ in state the pipeline does bake (target formats and
+// sample counts, blend factors, topology): those are different pipelines.
+static bool KeyNormalizeOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_PIPELINE_KEY_NORMALIZE");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+static void NormalizePipelineKey(GraphicsPipelineKey& key) {
+    if (!KeyNormalizeOn()) {
+        return;
+    }
+    const u32 used = std::min<u32>(key.num_color_attachments, AmdGpu::NUM_COLOR_BUFFERS);
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        auto& bc = key.blend_controls[cb];
+        if (cb >= used) {
+            std::memset(&key.color_buffers[cb], 0, sizeof(key.color_buffers[cb]));
+            std::memset(&bc, 0, sizeof(bc));
+            key.write_masks[cb] = vk::ColorComponentFlags{};
+            key.color_samples[cb] = 0;
+            continue;
+        }
+        if (!bc.enable) {
+            std::memset(&bc, 0, sizeof(bc));
+            continue;
+        }
+        AmdGpu::BlendControl clean;
+        std::memset(&clean, 0, sizeof(clean));
+        clean.color_src_factor = bc.color_src_factor;
+        clean.color_func = bc.color_func;
+        clean.color_dst_factor = bc.color_dst_factor;
+        if (bc.separate_alpha_blend) {
+            clean.alpha_src_factor = bc.alpha_src_factor;
+            clean.alpha_func = bc.alpha_func;
+            clean.alpha_dst_factor = bc.alpha_dst_factor;
+            clean.separate_alpha_blend = 1;
+        }
+        clean.enable = 1;
+        std::memcpy(&bc, &clean, sizeof(bc));
+    }
+}
+
+// PRT-TESS (pr-tests, diagnosis; rides RYGT_PERF_LINE, =0 off): owner logs show ~15.8k skipped
+// tessellated draws and many FIX-227 LDS barrier runs. Why a tessellated draw finds no pipeline
+// key, counted on draws (not the read-ahead) and logged every 10 s while it changes, so the next
+// build can fix the biggest cause. Nothing changes how draws are drawn.
+namespace {
+struct TessSkips {
+    std::atomic<u64> unsupported{0}; ///< no tessellation on the GPU
+    std::atomic<u64> no_program{0};  ///< a tess stage disabled or without a program
+    std::atomic<u64> constants{0};   ///< the hull's constants not sane (FIX-058)
+    std::atomic<u64> translation{0}; ///< a stage could not be translated (FIX-034)
+    std::atomic<u64> geometry{0};    ///< tess + geometry, geometry unsupported or its features
+    std::atomic<u64> logged_total{0};
+    std::atomic<s64> last_ns{0};
+};
+TessSkips g_tess_skips;
+} // namespace
+
+static void NoteTessSkip(std::atomic<u64>& counter, bool read_ahead) {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_PERF_LINE");
+        return !(env && env[0] == '0');
+    }();
+    if (!on || read_ahead) {
+        return;
+    }
+    counter.fetch_add(1, std::memory_order_relaxed);
+    auto& t = g_tess_skips;
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 last = t.last_ns.load(std::memory_order_relaxed);
+    if (last == 0) {
+        t.last_ns.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10'000'000'000 ||
+        !t.last_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+        return;
+    }
+    const u64 unsupported = t.unsupported.load(std::memory_order_relaxed);
+    const u64 no_program = t.no_program.load(std::memory_order_relaxed);
+    const u64 constants = t.constants.load(std::memory_order_relaxed);
+    const u64 translation = t.translation.load(std::memory_order_relaxed);
+    const u64 geometry = t.geometry.load(std::memory_order_relaxed);
+    const u64 total = unsupported + no_program + constants + translation + geometry;
+    LOG_WARNING(Render_Vulkan,
+                "PRT-TESS: tessellated draws without a pipeline key, in all: {} (+{} since the "
+                "last line): {} tessellation unsupported, {} stage without a program, {} hull "
+                "constants not sane, {} stage not translated, {} with a geometry stage",
+                total, total - t.logged_total.exchange(total, std::memory_order_relaxed),
+                unsupported, no_program, constants, translation, geometry);
+}
+
+// PRT-KEYNORM (diagnosis): the key fields two keys differ in, by name (the PRT-KEEP lines).
+static std::string DescribeKeyDiff(const GraphicsPipelineKey& a, const GraphicsPipelineKey& b) {
+    std::string out;
+    const auto add = [&](const std::string& name) {
+        if (!out.empty()) {
+            out += ',';
+        }
+        out += name;
+    };
+    const auto differs = [](const auto& x, const auto& y) {
+        return std::memcmp(&x, &y, sizeof(x)) != 0;
+    };
+    if (differs(a.stage_hashes, b.stage_hashes)) {
+        add("stages");
+    }
+    if (differs(a.vertex_buffer_formats, b.vertex_buffer_formats)) {
+        add("vertex formats");
+    }
+    if (a.patch_control_points != b.patch_control_points) {
+        add("patch points");
+    }
+    if (a.num_color_attachments != b.num_color_attachments) {
+        add(fmt::format("targets {}/{}", a.num_color_attachments, b.num_color_attachments));
+    }
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        if (differs(a.color_buffers[cb], b.color_buffers[cb])) {
+            add(fmt::format("cb{} format", cb));
+        }
+        if (differs(a.blend_controls[cb], b.blend_controls[cb])) {
+            add(fmt::format("cb{} blend", cb));
+        }
+        if (a.write_masks[cb] != b.write_masks[cb]) {
+            add(fmt::format("cb{} mask", cb));
+        }
+        if (a.color_samples[cb] != b.color_samples[cb]) {
+            add(fmt::format("cb{} samples", cb));
+        }
+    }
+    if (differs(a.cb_shader_mask, b.cb_shader_mask)) {
+        add("shader mask");
+    }
+    if (a.logic_op != b.logic_op) {
+        add("logic op");
+    }
+    if (a.num_samples != b.num_samples || a.depth_samples != b.depth_samples) {
+        add("samples");
+    }
+    if (a.mrt_mask != b.mrt_mask) {
+        add("mrt");
+    }
+    if (a.z_format != b.z_format || a.stencil_format != b.stencil_format) {
+        add("depth format");
+    }
+    if (a.depth_clamp_enable != b.depth_clamp_enable) {
+        add("depth clamp");
+    }
+    if (a.alpha_to_coverage != b.alpha_to_coverage) {
+        add("alpha to coverage");
+    }
+    if (a.prim_type != b.prim_type) {
+        add(fmt::format("prim {}/{}", static_cast<u32>(a.prim_type),
+                        static_cast<u32>(b.prim_type)));
+    }
+    if (a.polygon_mode != b.polygon_mode) {
+        add("polygon mode");
+    }
+    if (a.clip_space != b.clip_space) {
+        add("clip space");
+    }
+    if (a.provoking_vtx_last != b.provoking_vtx_last) {
+        add("provoking vertex");
+    }
+    if (a.depth_clip_enable != b.depth_clip_enable) {
+        add("depth clip");
+    }
+    if (out.empty()) {
+        add("padding");
+    }
+    return out;
+}
 static_assert(std::is_trivially_copyable_v<Shader::RuntimeInfo>);
 static_assert(std::is_trivially_copyable_v<Shader::Backend::Bindings>);
 static_assert(std::is_trivially_copyable_v<Shader::Info::PinnedFetchSharp>);
@@ -4209,6 +4397,7 @@ bool PipelineCache::RefreshGraphicsKey() {
         }
     }
 
+    NormalizePipelineKey(key); // PRT-KEYNORM
     return true;
 }
 
@@ -4280,6 +4469,8 @@ bool PipelineCache::RefreshGraphicsStages() {
 
     S().infos.fill(nullptr);
     S().modules.fill(nullptr);
+    bool tessellated = false; // PRT-TESS
+    const bool read_ahead = regs_override != nullptr || t_lookup_only;
 
     bind_stage(HwStage::Fragment, SwStage::Fragment);
 
@@ -4309,32 +4500,42 @@ bool PipelineCache::RefreshGraphicsStages() {
         }
         break;
     case AmdGpu::ShaderStageEnable::VgtStages::LsHs:
+        tessellated = true;
         if (!instance.IsTessellationSupported()) {
+            NoteTessSkip(g_tess_skips.unsupported, read_ahead); // PRT-TESS
             return false;
         }
         if (!bind_stage(HwStage::Hull, SwStage::TessellationControl)) {
+            NoteTessSkip(g_tess_skips.no_program, read_ahead);
             return false;
         }
         if (const auto* hull = S().infos[u32(SwStage::TessellationControl)];
             !hull || !SaneTessConstants(*hull, liverpool, regs_override != nullptr)) {
+            NoteTessSkip(hull ? g_tess_skips.constants : g_tess_skips.translation, read_ahead);
             return false; // FIX-058: the local stage reads the hull's constants
         }
         if (!bind_stage(HwStage::Vertex, SwStage::TessellationEval)) {
+            NoteTessSkip(g_tess_skips.no_program, read_ahead);
             return false;
         }
         if (!bind_stage(HwStage::Local, SwStage::Vertex)) {
+            NoteTessSkip(g_tess_skips.no_program, read_ahead);
             return false;
         }
         break;
     case AmdGpu::ShaderStageEnable::VgtStages::LsHsEsGs:
+        tessellated = true;
         if (!instance.IsTessellationSupported()) {
+            NoteTessSkip(g_tess_skips.unsupported, read_ahead); // PRT-TESS
             return false;
         }
         if (!instance.IsGeometryStageSupported()) {
+            NoteTessSkip(g_tess_skips.geometry, read_ahead);
             LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
             return false;
         }
         if (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw) {
+            NoteTessSkip(g_tess_skips.geometry, read_ahead);
             LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
             return false;
         }
@@ -4363,6 +4564,9 @@ bool PipelineCache::RefreshGraphicsStages() {
         return false;
     }
     if (stage_failed) {
+        if (tessellated) {
+            NoteTessSkip(g_tess_skips.translation, read_ahead); // PRT-TESS
+        }
         return false;
     }
 
@@ -5286,7 +5490,10 @@ void PipelineCache::NotePipelineInstalled() {
 // differ, for the first 20, then a count every 100. Tells which state keeps such pipelines from
 // being prewarmed.
 void PipelineCache::NotePrewarmMiss(const GraphicsPipelineKey& key) {
-    std::string ranges;
+    // PRT-KEYNORM: the differing fields by name, and a tally of them in the every-100 line.
+    static std::unordered_map<std::string, u32> by_fields; // under prewarm_mutex
+    std::string fields;
+    std::string tally;
     u32 count = 0;
     {
         std::scoped_lock lk{prewarm_mutex};
@@ -5294,38 +5501,34 @@ void PipelineCache::NotePrewarmMiss(const GraphicsPipelineKey& key) {
         if (it == prewarm_by_stages.end()) {
             return;
         }
-        const auto* a = reinterpret_cast<const u8*>(&it->second);
-        const auto* b = reinterpret_cast<const u8*>(&key);
-        if (std::memcmp(a, b, sizeof(key)) == 0) {
+        if (std::memcmp(&it->second, &key, sizeof(key)) == 0) {
             return;
         }
+        fields = DescribeKeyDiff(it->second, key);
+        ++by_fields[fields];
         count = ++prewarm_misses;
         if (count > 20 && count % 100 != 0) {
             return;
         }
-        if (count <= 20) {
-            for (size_t i = 0; i < sizeof(key) && ranges.size() < 200;) {
-                if (a[i] == b[i]) {
-                    ++i;
-                    continue;
-                }
-                size_t j = i;
-                while (j < sizeof(key) && a[j] != b[j]) {
-                    ++j;
-                }
-                ranges += fmt::format(" [{}..{})", i, j);
-                i = j;
+        if (count > 20) {
+            std::vector<std::pair<std::string, u32>> sorted(by_fields.begin(), by_fields.end());
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const auto& x, const auto& y) { return x.second > y.second; });
+            for (size_t n = 0; n < sorted.size() && n < 8; ++n) {
+                tally += fmt::format(" [{}]={}", sorted[n].first, sorted[n].second);
             }
         }
     }
     if (count <= 20) {
         LOG_WARNING(Render_Vulkan,
                     "PRT-KEEP: a new pipeline has a recorded one's stages but another key (miss "
-                    "{}; key {} bytes, differing:{})",
-                    count, sizeof(key), ranges);
+                    "{}; differing: {}; PRT-KEYNORM {})",
+                    count, fields, KeyNormalizeOn() ? "on" : "off");
     } else {
-        LOG_WARNING(Render_Vulkan, "PRT-KEEP: {} new pipelines had a recorded one's stages but "
-                                   "another key", count);
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-KEEP: {} new pipelines had a recorded one's stages but another key "
+                    "(PRT-KEYNORM {}); most often:{}",
+                    count, KeyNormalizeOn() ? "on" : "off", tally);
     }
 }
 
@@ -5518,6 +5721,11 @@ void PipelineCache::PrewarmPipelines(std::stop_token stop) {
         LOG_WARNING(Render_Vulkan, "PRT-PREWARM: reading the recorded pipelines stopped: {}",
                     e.what());
     }
+    // PRT-KEYNORM: records written before it (or with it off) match normalised draws again;
+    // their layout is unchanged (PrewarmKeyLayout stays 1, no store wipe).
+    for (auto& key : keys) {
+        NormalizePipelineKey(key);
+    }
     {
         // The two sources can hold the same key: once each.
         std::unordered_set<u64> unique;
@@ -5543,6 +5751,8 @@ void PipelineCache::PrewarmPipelines(std::stop_token stop) {
     const auto start_time = std::chrono::steady_clock::now();
     std::atomic<size_t> next{0};
     std::atomic<u32> built{0}, game_first{0}, not_buildable{0}, failed{0};
+    // PRT-KEYNORM (diagnosis): why records were not buildable.
+    std::atomic<u32> nb_targets{0}, nb_geometry{0}, nb_no_vertex{0}, nb_stage{0};
     const auto work = [&](u32 index) {
         Common::SetCurrentThreadName(fmt::format("shadGT:Prewarm{}", index).c_str());
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
@@ -5561,10 +5771,19 @@ void PipelineCache::PrewarmPipelines(std::stop_token stop) {
                     continue;
                 }
             }
-            if (!PrewarmColorTargetsSupported(key) ||
-                key.stage_hashes[u32(Shader::SwStage::Geometry)] != 0 ||
-                key.stage_hashes[u32(Shader::SwStage::Vertex)] == 0) {
+            if (!PrewarmColorTargetsSupported(key)) {
                 ++not_buildable;
+                ++nb_targets;
+                continue;
+            }
+            if (key.stage_hashes[u32(Shader::SwStage::Geometry)] != 0) {
+                ++not_buildable;
+                ++nb_geometry;
+                continue;
+            }
+            if (key.stage_hashes[u32(Shader::SwStage::Vertex)] == 0) {
+                ++not_buildable;
+                ++nb_no_vertex;
                 continue;
             }
             std::array<const Shader::Info*, MaxShaderStages> infos{};
@@ -5590,6 +5809,7 @@ void PipelineCache::PrewarmPipelines(std::stop_token stop) {
             }
             if (!usable) {
                 ++not_buildable;
+                ++nb_stage;
                 continue;
             }
             std::unique_ptr<GraphicsPipeline> pipeline;
@@ -5639,14 +5859,16 @@ void PipelineCache::PrewarmPipelines(std::stop_token stop) {
     driver_cache_save_requested.store(true, std::memory_order_release);
     LOG_WARNING(Render_Vulkan,
                 "PRT-PREWARM: {} recorded pipelines in {:.1f} s on {} threads: {} built, {} "
-                "skipped ({} built by the game first, {} not buildable from the store), {} "
-                "failed; {} records unreadable{}",
+                "skipped ({} built by the game first, {} not buildable from the store: {} "
+                "colour targets, {} geometry stage, {} no vertex stage, {} a stage not in the "
+                "store or not loadable), {} failed; {} records unreadable; PRT-KEYNORM {}{}",
                 keys.size(),
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time)
                     .count(),
                 count, built.load(), game_first.load() + not_buildable.load(), game_first.load(),
-                not_buildable.load(), failed.load(), unreadable,
-                stop.stop_requested() ? " (stopped)" : "");
+                not_buildable.load(), nb_targets.load(), nb_geometry.load(),
+                nb_no_vertex.load(), nb_stage.load(), failed.load(), unreadable,
+                KeyNormalizeOn() ? "on" : "off", stop.stop_requested() ? " (stopped)" : "");
 }
 
 void PipelineCache::DumpFailedShader(std::span<const u32> code, u64 hash, Shader::HwStage stage) {
