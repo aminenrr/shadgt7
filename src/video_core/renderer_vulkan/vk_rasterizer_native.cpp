@@ -407,6 +407,72 @@ bool NativeModeRequested() {
 }
 
 namespace {
+// PRT-JITTER (pr-tests, log only, RYGT_PRT_JITTER=0 turns it off): GT Auto still looks aliased
+// inside the menu temporal DLSS (Build B, 2026-11-19). Every 600 menu frames that ran temporal DLSS
+// with HD UI: jitter min/max, frames with zero jitter, frames whose jitter equals the frame
+// before (a stuck jitter gives DLSS nothing to resolve), the motion vector scale range and the
+// history resets. The motion vectors themselves stay on the GPU; their scale is what is logged.
+bool PrtJitterOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_PRT_JITTER");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+struct PrtJitterStats {
+    u64 frames = 0, zero = 0, repeated = 0, resets = 0;
+    float min_x = 0, max_x = 0, min_y = 0, max_y = 0;
+    float min_mx = 0, max_mx = 0, min_my = 0, max_my = 0;
+    float last_x = 0, last_y = 0;
+    bool have_last = false;
+};
+void PrtJitterNote(u64 frame, const RytyUpscale::TemporalInputs& in, const char* where) {
+    if (!PrtJitterOn()) {
+        return;
+    }
+    static PrtJitterStats st;
+    const float jx = in.jitter[0], jy = in.jitter[1];
+    const float mx = in.mvec_scale[0], my = in.mvec_scale[1];
+    if (st.frames == 0) {
+        st.min_x = st.max_x = jx;
+        st.min_y = st.max_y = jy;
+        st.min_mx = st.max_mx = mx;
+        st.min_my = st.max_my = my;
+    }
+    st.min_x = std::min(st.min_x, jx);
+    st.max_x = std::max(st.max_x, jx);
+    st.min_y = std::min(st.min_y, jy);
+    st.max_y = std::max(st.max_y, jy);
+    st.min_mx = std::min(st.min_mx, mx);
+    st.max_mx = std::max(st.max_mx, mx);
+    st.min_my = std::min(st.min_my, my);
+    st.max_my = std::max(st.max_my, my);
+    if (jx == 0.0f && jy == 0.0f) {
+        ++st.zero;
+    }
+    if (st.have_last && jx == st.last_x && jy == st.last_y) {
+        ++st.repeated;
+    }
+    if (in.reset) {
+        ++st.resets;
+    }
+    st.last_x = jx;
+    st.last_y = jy;
+    st.have_last = true;
+    if (++st.frames >= 600) {
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-JITTER: frame {} ({}): 600 menu temporal frames: jitter x {:.4f}..{:.4f} "
+                    "y {:.4f}..{:.4f} px, {} zero, {} same as the frame before, motion scale x "
+                    "{:.6f}..{:.6f} y {:.6f}..{:.6f}, {} history resets, size {}x{}",
+                    frame, where, st.min_x, st.max_x, st.min_y, st.max_y, st.zero, st.repeated,
+                    st.min_mx, st.max_mx, st.min_my, st.max_my, st.resets, in.size.width,
+                    in.size.height);
+        st = PrtJitterStats{};
+    }
+}
+} // namespace
+
+namespace {
 // OPT-013..015 on (RYGT_NATIVE_REUSE=0 off; DIAG-GT7-003 switches it while the game runs).
 std::atomic<bool> g_reuse_on{[] {
     const char* env = std::getenv("RYGT_NATIVE_REUSE");
@@ -5317,6 +5383,7 @@ void NativeRenderer::ScaleAfterLateComposite(const Targets& targets, bool deferr
     ++(temporal.hd_late_restart ? temporal.hd_late_temporal : temporal.hd_composite_temporal);
     if (!HdRace()) {
         ++temporal.hd_menu_temporal;
+        PrtJitterNote(frame, inputs, temporal.hd_late_restart ? "late scene" : "composite");
     }
     if (temporal.hd_late_temporal + temporal.hd_composite_temporal <= 4) {
         LOG_INFO(Render_Vulkan,
@@ -5914,6 +5981,9 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
                                 temporal.mirror, temporal.depth != nullptr,
                                 temporal.motion != nullptr);
                 }
+            }
+            if (hd_temporal && !HdRace()) {
+                PrtJitterNote(frame, *hd_temporal, "display draw");
             }
             UiHires::UpscaleNative(r.instance, r.scheduler.DirectCommandBuffer(), source_image,
                                    source_view, view_info.format, proxy, !proxy.native_dirty,

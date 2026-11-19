@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 RyGT Team
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// PRT-BINK30 (pr-tests, RYGT_BINK_30HZ=0 turns it off, on by default): GT7's pre-rendered
+// PRT-BINK30 (pr-tests, off by default since Build B2 2026-11-19, RYGT_BINK_30HZ=1 turns it on): GT7's pre-rendered
 // cutscenes (Bink, decoded on the CPU by the BinkT guest threads) skip frames at 60: the owner's
 // logs (2026-11-18) showed 82 to 98 flips per 2 s with 116 to 120 vblanks with no flip ready, the
 // video frames held an uneven 1, 2 or 3 vblanks. With the launcher's 30 lock (PERF-075) one flip
@@ -40,8 +40,10 @@ inline const char* ViaName(u32 via) {
 
 inline bool On() {
     static const bool on = [] {
+        // Build B2: off by default. The championship cutscenes are AvPlayer MP4s, not Bink, and the
+        // world map's small Bink video (BinkT04) locked the map to 30.
         const char* env = std::getenv("RYGT_BINK_30HZ");
-        return !(env && env[0] == '0');
+        return env && env[0] == '1';
     }();
     return on;
 }

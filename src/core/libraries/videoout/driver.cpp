@@ -282,7 +282,7 @@ bool FpsLockActive() {
     return FpsLock() != 0 && std::chrono::steady_clock::now() >= lock_from;
 }
 
-// PRT-BINK30 (pr-tests, RYGT_BINK_30HZ=0 turns it off): flips locked to 30 per second while a
+// PRT-BINK30 (pr-tests, off by default, RYGT_BINK_30HZ=1 turns it on): flips locked to 30 per second while a
 // Bink thread decodes a pre-rendered cutscene (common/prt_bink30.h), unless the user's own lock
 // is already 30 or lower. Only the present thread calls this. It turns on and off on an even
 // vblank, which is where a 30 lock on a 60 Hz vblank lets a flip happen, so no flip waits an
