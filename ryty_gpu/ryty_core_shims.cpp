@@ -23,6 +23,7 @@
 
 #include "common/logging/log.h"
 #include "common/perf_monitor.h"
+#include "common/prt_bink30.h"
 #include "common/read_capture.h"
 #include "core/address_space.h"
 #include "core/libraries/kernel/equeue.h"
@@ -475,6 +476,7 @@ static std::optional<GuestRange> GuestRangeOf(VAddr address) {
 }
 
 AreaAnswer LookupArea(VAddr virtual_addr, VAddr limit) {
+    PrtBink30::NoteActivity(PrtBink30::ViaLookup); // PRT-BINK30: a Bink thread decoding
     const auto range = GuestRangeOf(virtual_addr);
     if (!range) {
         return {0, true};

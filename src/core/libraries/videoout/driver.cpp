@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/guest_clock.h"
+#include "common/prt_bink30.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -279,6 +280,44 @@ bool FpsLockActive() {
                std::chrono::seconds(env ? std::strtoul(env, nullptr, 10) : 0);
     }();
     return FpsLock() != 0 && std::chrono::steady_clock::now() >= lock_from;
+}
+
+// PRT-BINK30 (pr-tests, RYGT_BINK_30HZ=0 turns it off): flips locked to 30 per second while a
+// Bink thread decodes a pre-rendered cutscene (common/prt_bink30.h), unless the user's own lock
+// is already 30 or lower. Only the present thread calls this. It turns on and off on an even
+// vblank, which is where a 30 lock on a 60 Hz vblank lets a flip happen, so no flip waits an
+// extra vblank at the change. 0 = no Bink lock.
+u32 Bink30LockFps(u64 vblank_count, bool user_locked, u32 user_lock) {
+    if (!PrtBink30::On()) {
+        return 0;
+    }
+    if (user_locked && user_lock != 0 && user_lock <= 30) {
+        return 0;
+    }
+    static bool on = false;
+    static s64 since_ns = 0;
+    static u64 hits_at_on = 0;
+    const s64 now = PrtBink30::NowNs();
+    const bool want = PrtBink30::Active(now);
+    if (want != on && (vblank_count & 1) == 0) {
+        on = want;
+        if (on) {
+            since_ns = now;
+            hits_at_on = PrtBink30::TotalHits();
+            LOG_WARNING(Lib_VideoOut,
+                        "PRT-BINK30: on (Bink thread {} active, via {}): flips locked to 30 per "
+                        "second",
+                        PrtBink30::ThreadName(),
+                        PrtBink30::ViaName(
+                            PrtBink30::GetState().last_via.load(std::memory_order_relaxed)));
+        } else {
+            LOG_WARNING(Lib_VideoOut,
+                        "PRT-BINK30: off after {:.1f} s ({} activity marks), flips back to the "
+                        "user's rate",
+                        double(now - since_ns) / 1e9, PrtBink30::TotalHits() - hits_at_on);
+        }
+    }
+    return on ? 30u : 0u;
 }
 
 void ReportFlipStats() {
@@ -588,8 +627,14 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
         const bool locked = FpsLockActive(); // PERF-075
-        const int flip_rate = LockedFlipRate(main_port.flip_rate, locked ? FpsLock() : 0,
-                                             EmulatorSettings.GetVblankFrequency());
+        u32 lock_fps = locked ? FpsLock() : 0;
+        // PRT-BINK30: a cutscene's Bink video locks flips to 30 (the lower of the two locks).
+        if (const u32 bink_fps = Bink30LockFps(vblank_status.count, locked, FpsLock());
+            bink_fps != 0 && (lock_fps == 0 || bink_fps < lock_fps)) {
+            lock_fps = bink_fps;
+        }
+        const int flip_rate =
+            LockedFlipRate(main_port.flip_rate, lock_fps, EmulatorSettings.GetVblankFrequency());
         if (vblank_status.count % (flip_rate + 1) == 0) {
             size_t queued_flips = 0; // DIAG-GT7-007
             {
