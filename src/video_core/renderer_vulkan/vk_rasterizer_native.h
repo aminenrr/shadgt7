@@ -445,6 +445,17 @@ private:
         u64 hd_race_off_frame = ~u64{0}; ///< PRT-LATE: the last frame the race sign was off
         u64 hd_race_held_frame = ~u64{0};
         u64 hd_race_held = 0;            ///< frames the hold kept HD race off
+        /// PRT-GTAUTO2 (RYGT_HD_RACE_NO_READBACK): frames whose race sign was refused because
+        /// the display was read back (a menu's frosted panels, GT Auto), total and since the
+        /// last PRT-GTAUTO2 line; and the small depth picture that last gave the race sign.
+        u64 hd_race_refused_frame = ~u64{0};
+        u64 hd_race_refused = 0;
+        u64 hd_race_refused_window = 0;
+        u64 hd_gtauto2_logged_frame = 0;
+        VAddr hd_race_sign_address = 0;
+        u32 hd_race_sign_width = 0;
+        u32 hd_race_sign_height = 0;
+        u32 hd_race_sign_samples = 0;
         u32 hd_depth_giveups = 0;     ///< =2: proxy given up for a depth draw (logged)
         u64 scene_draw_frame = ~u64{0}; ///< the frame the first draw into a display was seen in
         bool through = false;         ///< logged

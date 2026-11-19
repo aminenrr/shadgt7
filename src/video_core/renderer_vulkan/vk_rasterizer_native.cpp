@@ -983,8 +983,45 @@ static u64 HdRaceHold() {
     return frames;
 }
 
+// PRT-GTAUTO2 (pr-tests, RYGT_HD_RACE_NO_READBACK=0 turns it off): GT Auto's 3D car is drawn
+// like a race's map (a small multisampled picture with depth, read by a display draw), so the
+// race sign above was on in GT Auto and its frames took the race path (aliased, low-res car). The
+// race HUD flag can't tell them apart with GPU.hd_ui (hud_depth_drawn needs the HUD split, off
+// under HD UI). A draw reading the display back (a menu's frosted panels) can: in the owner's
+// logs (2026-11-18 race + GT Auto, 2026-11-19 GT Auto) every race frame had no read-back and
+// every GT Auto frame had one. So with a read-back in the last 30 frames the sign is refused and
+// the frame takes the 3D menu path (RYGT_HD_UI_MENU_TDLSS temporal inputs), like garage and cafe.
+static bool HdRaceNoReadback() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_HD_RACE_NO_READBACK");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
 bool NativeRenderer::HdRace() {
-    const bool raw = temporal.hd_race_frame != ~u64{0} && frame - temporal.hd_race_frame <= 2;
+    bool raw = temporal.hd_race_frame != ~u64{0} && frame - temporal.hd_race_frame <= 2;
+    if (raw && HdRaceNoReadback() && temporal.display_read_frame != ~u64{0} &&
+        frame - temporal.display_read_frame <= 30) {
+        raw = false; // PRT-GTAUTO2
+        if (temporal.hd_race_refused_frame != frame) {
+            temporal.hd_race_refused_frame = frame;
+            ++temporal.hd_race_refused;
+            ++temporal.hd_race_refused_window;
+        }
+    }
+    // PRT-GTAUTO2: every 600 frames while frames were refused, how many, and the picture that
+    // gave the race sign (for another discriminator if a race ever reads the display back).
+    if (temporal.hd_race_refused_window != 0 && frame >= temporal.hd_gtauto2_logged_frame + 600) {
+        temporal.hd_gtauto2_logged_frame = frame;
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-GTAUTO2: frame {}: {} frames refused as HD race since the last line ({} "
+                    "in all): the display was read back; race sign from {:#x} {}x{} x{} samples",
+                    frame, temporal.hd_race_refused_window, temporal.hd_race_refused,
+                    temporal.hd_race_sign_address, temporal.hd_race_sign_width,
+                    temporal.hd_race_sign_height, temporal.hd_race_sign_samples);
+        temporal.hd_race_refused_window = 0;
+    }
     const u64 hold = HdRaceHold();
     if (hold == 0) {
         return raw;
@@ -5835,7 +5872,8 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
                             "switch {}, native dirty {} ({} menu frames temporal, {} fell back, "
                             "{} late scene, {} of them left as before; PRT-LATE: {} late scene "
                             "scaled temporal, {} late scene scaled single, {} composites scaled "
-                            "temporal right after, {} single, HD race held {} frames)",
+                            "temporal right after, {} single, HD race held {} frames; "
+                            "PRT-GTAUTO2: {} frames refused as race)",
                             frame, entry->info.guest_address, proxy.native.width,
                             proxy.native.height, give_up ? "nothing (given up)" : source,
                             hd_temporal ? "" : (pass_now ? ", single DLSS" : ", single (no pass)"),
@@ -5850,7 +5888,8 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
                             temporal.hd_menu_fallbacks, temporal.hd_late_restarts,
                             temporal.hd_late_missed, temporal.hd_late_temporal,
                             temporal.hd_late_single, temporal.hd_composite_temporal,
-                            temporal.hd_composite_single, temporal.hd_race_held);
+                            temporal.hd_composite_single, temporal.hd_race_held,
+                            temporal.hd_race_refused);
             }
             if (give_up) {
                 // No rejoin this frame, and the interface is shifted by the jitter as with
@@ -10912,6 +10951,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 const auto it = hd_race_depth_drawn.find(sampled->info.guest_address);
                 if (it != hd_race_depth_drawn.end() && it->second == frame) {
                     temporal.hd_race_frame = frame;
+                    // PRT-GTAUTO2 (diagnosis): the picture that gave the sign.
+                    temporal.hd_race_sign_address = sampled->info.guest_address;
+                    temporal.hd_race_sign_width = sampled->info.size.width;
+                    temporal.hd_race_sign_height = sampled->info.size.height;
+                    temporal.hd_race_sign_samples = u32(sampled->info.num_samples);
                     break;
                 }
             }
