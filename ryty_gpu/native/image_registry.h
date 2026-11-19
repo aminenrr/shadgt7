@@ -169,6 +169,12 @@ private:
 bool WatchedTexture(VAddr begin, VAddr end);
 /// FIX-156 (diagnosis): the watched addresses.
 const std::vector<VAddr>& WatchedTextures();
+/// PRT-AVTEX (pr-tests, Build B3, log only): AvPlayer frame buffers Ryty registers (RytyGpuAvTexRange);
+/// texture uploads and CPU write faults over them are counted for Ryty's [AVP] 2 s line.
+void AvTexRange(VAddr address, u64 size, bool add);
+void AvTexStats(u64* luma, u64* all, u64* faults);
+void AvTexNoteUpload(VAddr address, u64 size);
+void AvTexNoteFault(VAddr begin, VAddr end);
 /// FIX-156 (diagnosis): a fill of the watched address asks for a frame dump of the next frame.
 extern std::atomic<bool> g_dump_request;
 /// FIX-153 (diagnosis): the first 400 watched events of a kind, then one in 500.

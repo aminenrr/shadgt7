@@ -419,8 +419,20 @@ bool PrtJitterOn() {
     }();
     return on;
 }
+// PRT-JITTER v2 (Build B3): the game's raw offsets (c20, c21), the gap before each temporal frame
+// and the last reason a frame got no temporal pass, set by NoteTemporalDraw.
+float g_prt_raw_x = 0.0f, g_prt_raw_y = 0.0f;
+u64 g_prt_gap = 1;
+const char* g_prt_refuse = "none";
 struct PrtJitterStats {
     u64 frames = 0, zero = 0, repeated = 0, resets = 0;
+    float raw_min_x = 0, raw_max_x = 0, raw_min_y = 0, raw_max_y = 0;
+    u64 reset_gap2 = 0, reset_gap_short = 0, reset_gap_long = 0, reset_other = 0;
+    u32 period_min = 0, period_max = 0;
+    u64 no_period = 0;
+    const char* last_refuse = "none";
+    std::array<std::pair<float, float>, 64> ring{};
+    u32 ring_used = 0, ring_at = 0;
     float min_x = 0, max_x = 0, min_y = 0, max_y = 0;
     float min_mx = 0, max_mx = 0, min_my = 0, max_my = 0;
     float last_x = 0, last_y = 0;
@@ -434,6 +446,8 @@ void PrtJitterNote(u64 frame, const RytyUpscale::TemporalInputs& in, const char*
     const float jx = in.jitter[0], jy = in.jitter[1];
     const float mx = in.mvec_scale[0], my = in.mvec_scale[1];
     if (st.frames == 0) {
+        st.raw_min_x = st.raw_max_x = g_prt_raw_x;
+        st.raw_min_y = st.raw_max_y = g_prt_raw_y;
         st.min_x = st.max_x = jx;
         st.min_y = st.max_y = jy;
         st.min_mx = st.max_mx = mx;
@@ -455,6 +469,43 @@ void PrtJitterNote(u64 frame, const RytyUpscale::TemporalInputs& in, const char*
     }
     if (in.reset) {
         ++st.resets;
+        // PRT-JITTER v2: why the history restarted (frames since the last temporal pass).
+        if (g_prt_gap == 2) {
+            ++st.reset_gap2;
+        } else if (g_prt_gap > 2 && g_prt_gap <= 10) {
+            ++st.reset_gap_short;
+        } else if (g_prt_gap > 10) {
+            ++st.reset_gap_long;
+        } else {
+            ++st.reset_other;
+        }
+        st.last_refuse = g_prt_refuse;
+    }
+    st.raw_min_x = std::min(st.raw_min_x, g_prt_raw_x);
+    st.raw_max_x = std::max(st.raw_max_x, g_prt_raw_x);
+    st.raw_min_y = std::min(st.raw_min_y, g_prt_raw_y);
+    st.raw_max_y = std::max(st.raw_max_y, g_prt_raw_y);
+    // PRT-JITTER v2: the pattern's period (frames back to the same jitter pair, up to 64).
+    {
+        u32 period = 0;
+        for (u32 k = 1; k <= st.ring_used; ++k) {
+            const auto& p = st.ring[(st.ring_at + 64 - k) % 64];
+            if (p.first == jx && p.second == jy) {
+                period = k;
+                break;
+            }
+        }
+        if (st.ring_used == 64) {
+            if (period == 0) {
+                ++st.no_period;
+            } else {
+                st.period_min = st.period_min == 0 ? period : std::min(st.period_min, period);
+                st.period_max = std::max(st.period_max, period);
+            }
+        }
+        st.ring[st.ring_at] = {jx, jy};
+        st.ring_at = (st.ring_at + 1) % 64;
+        st.ring_used = std::min<u32>(st.ring_used + 1, 64);
     }
     st.last_x = jx;
     st.last_y = jy;
@@ -467,7 +518,21 @@ void PrtJitterNote(u64 frame, const RytyUpscale::TemporalInputs& in, const char*
                     frame, where, st.min_x, st.max_x, st.min_y, st.max_y, st.zero, st.repeated,
                     st.min_mx, st.max_mx, st.min_my, st.max_my, st.resets, in.size.width,
                     in.size.height);
+        LOG_WARNING(Render_Vulkan,
+                    "PRT-JITTER v2: game offsets c20 {:.6f}..{:.6f} c21 {:.6f}..{:.6f}; jitter x2 "
+                    "would span x {:.4f}..{:.4f} y {:.4f}..{:.4f} px; pattern period {}..{} frames "
+                    "({} frames with no repeat in 64); resets: {} after 1 frame without a pass, {} "
+                    "after 2 to 9, {} after 10+, {} other; last refuse: {}",
+                    st.raw_min_x, st.raw_max_x, st.raw_min_y, st.raw_max_y, st.min_x * 2.0f,
+                    st.max_x * 2.0f, st.min_y * 2.0f, st.max_y * 2.0f, st.period_min,
+                    st.period_max, st.no_period, st.reset_gap2, st.reset_gap_short,
+                    st.reset_gap_long, st.reset_other, st.last_refuse);
+        const auto ring = st.ring;
+        const u32 ring_used = st.ring_used, ring_at = st.ring_at;
         st = PrtJitterStats{};
+        st.ring = ring; // the period carries on across windows
+        st.ring_used = ring_used;
+        st.ring_at = ring_at;
     }
 }
 } // namespace
@@ -836,6 +901,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
         // (their pages hold the data the game rewrites every frame: watched, every one of those
         // writes faulted, 170,000-257,000 times in 10 s of a race).
         const u64 size = std::max<u64>(entry.info.guest_size, 1);
+        Native::AvTexNoteUpload(entry.info.guest_address, size); // PRT-AVTEX (log only)
         if (PolledFrameTexture(entry.info.guest_address, size)) {
             std::scoped_lock lock{polled_mutex};
             polled_textures.emplace_back(entry.info.guest_address, size);
@@ -11998,6 +12064,7 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
         }
     }
     const auto refuse = [&](const char* why) {
+        g_prt_refuse = why; // PRT-JITTER v2
         if (temporal.refused++ < 8) {
             LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: the temporal pass is not used: {}",
                         frame, why);
@@ -12063,7 +12130,10 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
     // DLSS (a resolved picture given with a jitter would be shifted back and forth by DLSS).
     if (temporal.frame != frame) {
         temporal.reset = temporal.frame + 1 != frame;
+        g_prt_gap = frame - temporal.frame; // PRT-JITTER v2
     }
+    g_prt_raw_x = c[20];
+    g_prt_raw_y = c[21];
     temporal.depth = depth;
     temporal.result = out;
     temporal.motion = motion;
@@ -14834,6 +14904,7 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
                     "memory {}", address, size, exact, Native::WatchedBytes(address));
     }
     NoteHistory(begin, end - begin, 7, exact != 0 ? address + exact : 0); // DIAG-187 (diagnosis)
+    Native::AvTexNoteFault(begin, end); // PRT-AVTEX (log only)
     if (RyDiag::Enabled()) {
         NoteFaultPages(begin, end); // DIAG-GT7-010
     }

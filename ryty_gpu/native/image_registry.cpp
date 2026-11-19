@@ -9,6 +9,9 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <shared_mutex>
+#include <utility>
+#include <vector>
 #include "common/diagnostics.h"
 #include "common/logging/log.h"
 #include "core/guest_hash.h"
@@ -103,6 +106,69 @@ Rhi::ImageDesc DescOf(const VideoCore::ImageInfo& info, bool render_target, bool
 } // namespace
 
 std::atomic<bool> g_dump_request{false};
+
+// PRT-AVTEX (pr-tests, Build B3): AvPlayer frame buffer ranges and counters. g_avtex_count lets every
+// upload and fault outside cutscenes leave after one atomic load.
+namespace {
+std::atomic<u32> g_avtex_count{0};
+std::shared_mutex g_avtex_mutex;
+std::vector<std::pair<VAddr, VAddr>> g_avtex_ranges;
+std::atomic<u64> g_avtex_luma{0}, g_avtex_all{0}, g_avtex_faults{0};
+} // namespace
+
+void AvTexRange(VAddr address, u64 size, bool add) {
+    std::unique_lock lock{g_avtex_mutex};
+    const std::pair<VAddr, VAddr> range{address, address + std::max<u64>(size, 1)};
+    const auto it = std::find(g_avtex_ranges.begin(), g_avtex_ranges.end(), range);
+    if (add && it == g_avtex_ranges.end()) {
+        g_avtex_ranges.push_back(range);
+    } else if (!add && it != g_avtex_ranges.end()) {
+        g_avtex_ranges.erase(it);
+    }
+    g_avtex_count.store(static_cast<u32>(g_avtex_ranges.size()), std::memory_order_release);
+}
+
+void AvTexStats(u64* luma, u64* all, u64* faults) {
+    if (luma) {
+        *luma = g_avtex_luma.load(std::memory_order_relaxed);
+    }
+    if (all) {
+        *all = g_avtex_all.load(std::memory_order_relaxed);
+    }
+    if (faults) {
+        *faults = g_avtex_faults.load(std::memory_order_relaxed);
+    }
+}
+
+void AvTexNoteUpload(VAddr address, u64 size) {
+    if (g_avtex_count.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    const VAddr end = address + std::max<u64>(size, 1);
+    std::shared_lock lock{g_avtex_mutex};
+    for (const auto& [begin, limit] : g_avtex_ranges) {
+        if (address < limit && end > begin) {
+            g_avtex_all.fetch_add(1, std::memory_order_relaxed);
+            if (address == begin) {
+                g_avtex_luma.fetch_add(1, std::memory_order_relaxed);
+            }
+            return;
+        }
+    }
+}
+
+void AvTexNoteFault(VAddr begin, VAddr end) {
+    if (g_avtex_count.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    std::shared_lock lock{g_avtex_mutex};
+    for (const auto& [lo, hi] : g_avtex_ranges) {
+        if (begin < hi && end > lo) {
+            g_avtex_faults.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
 
 const std::vector<VAddr>& WatchedTextures() {
     static const std::vector<VAddr> watched = [] {

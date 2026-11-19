@@ -871,6 +871,15 @@ extern "C" __declspec(dllexport) int RytyGpuNeoSupported() {
     return 1;
 }
 
+// PRT-AVTEX (pr-tests, Build B3, log only): Ryty's AvPlayer registers its frame buffers (add 1) and
+// removes them (add 0); uploads of textures over them and CPU write faults on them are counted.
+extern "C" __declspec(dllexport) void RytyGpuAvTexRange(u64 address, u64 size, int add) {
+    Native::AvTexRange(address, size, add != 0);
+}
+extern "C" __declspec(dllexport) void RytyGpuAvTexStats(u64* luma, u64* all, u64* faults) {
+    Native::AvTexStats(luma, all, faults);
+}
+
 // Ryty calls this before the kernel writes guest memory directly (a file read into a guest
 // buffer), which would fail on a write-protected page instead of faulting.
 extern "C" __declspec(dllexport) void RytyGpuInvalidateMemory(u64 address, u64 size) {
