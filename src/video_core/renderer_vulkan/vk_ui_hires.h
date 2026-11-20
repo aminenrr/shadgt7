@@ -94,6 +94,8 @@ struct Proxy {
     /// stops for good: a failure, e.g. over the VRAM budget, only pauses it for ~2 s).
     u32 dlss_retry_in = 0;
     bool dlss_used = false;
+    /// PRT-GTAUTO5 (Build B5, diagnosis): the last DLSS scale had temporal inputs.
+    bool dlss_temporal = false;
     bool native_stale = false; ///< the proxy got draws the display buffer has not
     bool native_dirty = false; ///< native draws must be copied back to the proxy
     std::shared_ptr<DepthProxy> depth;
@@ -433,6 +435,7 @@ inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::I
         NativeBarrier(cmd, image, input_layout, vk::ImageLayout::eTransferSrcOptimal);
     }
     proxy.dlss_used = scaled;
+    proxy.dlss_temporal = scaled && temporal != nullptr; // PRT-GTAUTO5
     ProxyBarrier(cmd, proxy, vk::ImageLayout::eTransferDstOptimal,
                  vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
     const auto region = NativeBlit(scaled ? proxy.size : proxy.native, proxy.size);
@@ -485,6 +488,8 @@ inline void ResolveNative(vk::CommandBuffer cmd, vk::Image image, Proxy& proxy, 
 struct Shown {
     vk::ImageView view;
     vk::Extent2D size;
+    bool dlss = false;     ///< PRT-GTAUTO5: its scene was scaled by DLSS
+    bool temporal = false; ///< PRT-GTAUTO5: with temporal inputs
 };
 
 /// At a flip of the display buffer at `address`: the proxy to show instead, if it holds the
@@ -523,7 +528,8 @@ inline std::optional<Shown> TakeFrame(const Instance& instance, vk::CommandBuffe
                      vk::PipelineStageFlagBits2::eFragmentShader |
                          vk::PipelineStageFlagBits2::eComputeShader,
                      vk::AccessFlagBits2::eShaderRead);
-        shown = Shown{View(instance, proxy, view_format, true), proxy.size};
+        shown = Shown{View(instance, proxy, view_format, true), proxy.size, proxy.dlss_used,
+                      proxy.dlss_temporal};
     }
     proxy.phase = Phase::Idle;
     proxy.native_dirty = false;

@@ -1040,6 +1040,26 @@ bool UpscaleSupports(vk::Extent2D input, vk::Extent2D output) {
     return g_sl.sr_mode >= 0;
 }
 
+// PRT-GTAUTO5 (Build B5, pr-tests, diagnosis): the kind of each Upscale call, so the presenter
+// can say which DLSS output it shows on GT Auto (LastCallKind).
+namespace {
+std::atomic<u32> g_prt_last_kind{0};
+std::array<std::atomic<u64>, 5> g_prt_kind_calls{};
+void PrtNoteKind(u32 kind) {
+    g_prt_last_kind.store(kind, std::memory_order_relaxed);
+    g_prt_kind_calls[kind].fetch_add(1, std::memory_order_relaxed);
+}
+} // namespace
+
+u32 LastCallKind() {
+    return g_prt_last_kind.load(std::memory_order_relaxed);
+}
+
+u64 CallCount(u32 kind) {
+    return kind < g_prt_kind_calls.size() ? g_prt_kind_calls[kind].load(std::memory_order_relaxed)
+                                          : 0;
+}
+
 bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf,
              vk::Image input_image, vk::ImageView input, vk::Format input_format,
              vk::Extent2D input_size, vk::Image output_image, vk::ImageView output,
@@ -1289,6 +1309,7 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     if (!ok) {
         ++stat_failed;
     }
+    PrtNoteKind(!ok ? 0u : own ? 4u : side ? 3u : ran_temporal ? 1u : 2u); // PRT-GTAUTO5
     if (own) {
         // PRT-HDUI-VP: the HD UI viewport keeps its own history state only.
         if (ok) {

@@ -1101,6 +1101,40 @@ static unsigned HdUiViewport() {
     return viewport;
 }
 
+// PRT-GTAUTO F1 (Build B5, pr-tests, RYGT_GTAUTO_GAME_AA=1, off by default): on GT Auto the
+// game's own anti-aliasing pass keeps its result (no un-resolved colour handed to DLSS); DLSS
+// then scales GT Auto's resolved picture as a single frame.
+static bool GtAutoGameAa() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_GTAUTO_GAME_AA");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+// PRT-GTAUTO F2 (Build B5, pr-tests, RYGT_GTAUTO_TEMPORAL_PRESENT=1, off by default; with G3):
+// the B4 logs show GT Auto rotates three display buffers, and G3's early give-up only matched
+// the buffer of the last late composite, so it never fired: each frame the early display draw
+// scaled the HD UI picture as a single frame (the side viewport call), and the late composite
+// then copied that picture back down before the presenter's temporal DLSS. With F2 the early
+// draw of any display buffer on GT Auto gives the picture up at once, so the only DLSS call is
+// the presenter's, with depth, motion vectors and jitter, on an untouched display.
+static bool GtAutoTemporalPresent() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_GTAUTO_TEMPORAL_PRESENT");
+        return HdUiLateGiveUp() && env && env[0] == '1';
+    }();
+    return on;
+}
+
+bool NativeRenderer::GtAutoScreen() const {
+    const bool late = temporal.hd_late_seen_frame != ~u64{0} &&
+                      frame - temporal.hd_late_seen_frame <= 2;
+    const bool sign = temporal.hd_race_frame != ~u64{0} && frame - temporal.hd_race_frame <= 2;
+    const bool read_back =
+        temporal.display_read_frame != ~u64{0} && frame - temporal.display_read_frame <= 30;
+    return late || (sign && read_back);
+}
+
 // PRT-LATE (pr-tests, RYGT_HD_RACE_HOLD=<frames>, 30 by default, 0 = off): the race sign HD UI
 // goes by (a map drawn with depth this frame) flickers in 3D menus. Once it is off, it stays off
 // this many frames before it may turn on again.
@@ -5483,8 +5517,10 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
         // PRT-GTAUTO: the composite came after the display draw held back for it (G1, G3):
         // the screen still composites late.
         if (cb == 0 && temporal.composite_now && temporal.hd_late_early_frame == frame &&
-            temporal.hd_late_seen_address == entry->info.guest_address) {
+            (GtAutoTemporalPresent() || // PRT-GTAUTO F2: any of the display buffers
+             temporal.hd_late_seen_address == entry->info.guest_address)) {
             temporal.hd_late_seen_frame = frame;
+            temporal.hd_late_seen_address = entry->info.guest_address;
         }
         // PRT-GTAUTO G4 (diagnosis): every 600 frames on a late-composite screen, how it went.
         if (cb == 0 && temporal.hd_late_seen_frame != ~u64{0} &&
@@ -5495,11 +5531,14 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
                         "PRT-GTAUTO: frame {}: late-composite screen on {:#x}: {} given to the "
                         "presenter's DLSS at the composite, {} at the early draw (G3 {}), {} early "
                         "scales held for the composite (G1 {}), {} scaled temporal right after, "
-                        "{} single, HD UI viewport {}",
+                        "{} single, HD UI viewport {}; F1 game AA {} ({} passes kept), F2 {} ({} "
+                        "early draws on another buffer given up)",
                         frame, temporal.hd_late_seen_address, temporal.hd_late_giveups,
                         temporal.hd_late_early_giveups, HdUiLateGiveUp() ? "on" : "off",
                         temporal.hd_late_deferred, HdUiLateSkipEarly() ? "on" : "off",
-                        temporal.hd_late_temporal, temporal.hd_late_single, HdUiViewport());
+                        temporal.hd_late_temporal, temporal.hd_late_single, HdUiViewport(),
+                        GtAutoGameAa() ? "on" : "off", temporal.gtauto_game_aa,
+                        GtAutoTemporalPresent() ? "on" : "off", temporal.gtauto_early_skips);
         }
         // Why this draw cannot render into the proxy, or null when it can.
         if (temporal.hd_trace_frame == frame && cb == 0 && temporal.hd_trace_draws < 48) {
@@ -5816,13 +5855,19 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
             return; // The first supported display draw remains the native scene composite.
         }
         // PRT-GTAUTO: a screen that composited late within the last two frames (GT Auto).
+        // PRT-GTAUTO F2 (Build B5): any display buffer counts (GT Auto rotates three).
         const bool late_screen = cb == 0 && proxy.phase == UiHires::Phase::Scene &&
                                  temporal.hd_late_seen_frame != ~u64{0} &&
                                  frame - temporal.hd_late_seen_frame <= 2 &&
-                                 temporal.hd_late_seen_address == entry->info.guest_address;
+                                 (GtAutoTemporalPresent() ||
+                                  temporal.hd_late_seen_address == entry->info.guest_address);
         if (late_screen && HdUiLateGiveUp()) {
             // G3: given up now, before a DLSS call that its composite would undo.
             ++temporal.hd_late_early_giveups;
+            if (GtAutoTemporalPresent() &&
+                temporal.hd_late_seen_address != entry->info.guest_address) {
+                ++temporal.gtauto_early_skips; // PRT-GTAUTO F2
+            }
             temporal.hd_late_early_frame = frame;
             temporal.hd_ui_scene_frame = frame;
             proxy.phase = UiHires::Phase::Off;
@@ -12065,6 +12110,16 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
             return;
         }
     }
+    // PRT-GTAUTO F1 (Build B5, RYGT_GTAUTO_GAME_AA=1): GT Auto keeps the game's own pass.
+    if (GtAutoGameAa() && GtAutoScreen()) {
+        if (temporal.gtauto_game_aa++ == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "PRT-GTAUTO F1: frame {}: GT Auto keeps the game's anti-aliasing pass "
+                        "(RYGT_GTAUTO_GAME_AA=1)",
+                        frame);
+        }
+        return;
+    }
     const auto refuse = [&](const char* why) {
         g_prt_refuse = why; // PRT-JITTER v2
         if (temporal.refused++ < 8) {
@@ -12140,8 +12195,10 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
             const int n = env ? std::atoi(env) : 0;
             return static_cast<u64>(std::clamp(n, 0, 8));
         }();
-        temporal.reset = temporal.frame == ~u64{0} || frame < temporal.frame ||
-                         frame - temporal.frame > 1 + gap_kept;
+        // PRT-GAP R1 (Build B5): unset or 0 is exactly the B3 test again (B4 texture popping).
+        temporal.reset = gap_kept == 0 ? temporal.frame + 1 != frame
+                                       : temporal.frame == ~u64{0} || frame < temporal.frame ||
+                                             frame - temporal.frame > 1 + gap_kept;
         g_prt_gap = frame - temporal.frame; // PRT-JITTER v2
     }
     g_prt_raw_x = c[20];
@@ -15455,7 +15512,10 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
             display.image)) {
         display.output_view = shown->view;
         display.output_size = shown->size;
+        display.output_dlss = shown->dlss;         // PRT-GTAUTO5
+        display.output_temporal = shown->temporal; // PRT-GTAUTO5
     }
+    display.gtauto = GtAutoScreen(); // PRT-GTAUTO5
     // GT7-UW: the HUD drawn into this display in the frame just finished (frame counted it).
     if (HudSplitOn()) {
         const auto it = hud_layers.find(info.guest_address);

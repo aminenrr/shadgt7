@@ -27,6 +27,7 @@
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #ifdef RYTY_GPU
+#include "ryty_gpu/ryty_dlssg.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
 #endif
 #include "video_core/texture_cache/image.h"
@@ -1527,6 +1528,75 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         dlss_view != image_view) {
         image_view = dlss_view;
         scaled = true;
+    }
+    // PRT-GTAUTO5 (Build B5, pr-tests, log only; RYGT_PRT_GTAUTO5=0 off): on GT Auto, which DLSS
+    // output is shown: the HD UI picture (scaled with or without temporal inputs), the
+    // presenter's own DLSS call (temporal, single, side viewport) or none; with the DLSS calls of
+    // each kind in the same frames. One line every 600 GT Auto frames.
+    if (display->gtauto) {
+        static const bool gtauto5 = [] {
+            const char* env = std::getenv("RYGT_PRT_GTAUTO5");
+            return !(env && env[0] == '0');
+        }();
+        struct GtAuto5 {
+            u64 frames = 0, hd_temporal = 0, hd_single = 0, hd_plain = 0, own_temporal = 0,
+                own_single = 0, own_side = 0, own_other = 0, none = 0, with_inputs = 0,
+                resets = 0;
+            std::array<u64, 5> calls_at{};
+        };
+        static GtAuto5 g5;
+        if (gtauto5) {
+            if (g5.frames == 0) {
+                for (u32 k = 0; k < 5; ++k) {
+                    g5.calls_at[k] = RytyDlssG::CallCount(k);
+                }
+            }
+            ++g5.frames;
+            g5.with_inputs += display->temporal.has_value() ? 1 : 0;
+            g5.resets += display->temporal && display->temporal->reset ? 1 : 0;
+            if (display->output_view) {
+                ++(!display->output_dlss      ? g5.hd_plain
+                   : display->output_temporal ? g5.hd_temporal
+                                              : g5.hd_single);
+            } else if (!scaled) {
+                ++g5.none;
+            } else {
+                switch (RytyDlssG::LastCallKind()) {
+                case 1:
+                    ++g5.own_temporal;
+                    break;
+                case 2:
+                    ++g5.own_single;
+                    break;
+                case 3:
+                    ++g5.own_side;
+                    break;
+                default:
+                    ++g5.own_other;
+                    break;
+                }
+            }
+            if (g5.frames >= 600) {
+                std::array<u64, 5> calls{};
+                for (u32 k = 0; k < 5; ++k) {
+                    calls[k] = RytyDlssG::CallCount(k) - g5.calls_at[k];
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "PRT-GTAUTO5: 600 GT Auto frames shown: HD UI picture {} (DLSS "
+                            "temporal {}, DLSS single {}, plain {}); presenter DLSS {} (temporal "
+                            "{}, single {}, side viewport {}, other {}); not DLSS {}. Frames with "
+                            "temporal inputs {} ({} history resets). DLSS calls in these frames: "
+                            "{} temporal, {} single, {} side viewport, {} HD UI viewport, {} "
+                            "failed",
+                            g5.hd_temporal + g5.hd_single + g5.hd_plain, g5.hd_temporal,
+                            g5.hd_single, g5.hd_plain,
+                            g5.own_temporal + g5.own_single + g5.own_side + g5.own_other,
+                            g5.own_temporal, g5.own_single, g5.own_side, g5.own_other, g5.none,
+                            g5.with_inputs, g5.resets, calls[1], calls[2], calls[3], calls[4],
+                            calls[0]);
+                g5 = GtAuto5{};
+            }
+        }
     }
     if (!scaled && fsr_settings.enable) {
         const float sharpness =

@@ -55,6 +55,13 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
              vk::Format output_format, vk::Extent2D output_size,
              const RytyUpscale::TemporalInputs* temporal = nullptr);
 
+/// PRT-GTAUTO5 (Build B5, pr-tests, diagnosis): the kind of the last Upscale call: 0 failed (or
+/// none yet), 1 temporal, 2 single frame, 3 single frame on the side viewport, 4 the HD UI
+/// viewport.
+u32 LastCallKind();
+/// Upscale calls of one kind so far (kinds as LastCallKind).
+u64 CallCount(u32 kind);
+
 /// Around the swapchain present (Reflex/PCL markers DLSS-G needs to pair frames).
 void PresentStart();
 void PresentEnd();

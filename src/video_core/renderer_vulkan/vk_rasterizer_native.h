@@ -137,6 +137,11 @@ public:
         /// size), at `output_size`; null without one.
         vk::ImageView output_view{};
         vk::Extent2D output_size{};
+        /// PRT-GTAUTO5 (Build B5, diagnosis): the proxy's scene went through DLSS, and with
+        /// temporal inputs; and whether the frame was a GT Auto screen (GtAutoScreen).
+        bool output_dlss = false;
+        bool output_temporal = false;
+        bool gtauto = false;
     };
     /// `window` is the size the presenter's frame has (GPU.hd_ui sizes its proxy from it).
     std::optional<Display> FindDisplay(const VideoCore::ImageInfo& info, vk::Format view_format,
@@ -442,6 +447,8 @@ private:
         u64 hd_late_early_giveups = 0; ///< G3: given up at the early display draw already
         u64 hd_late_deferred = 0;      ///< G1: early scales held back for the composite
         u64 hd_gtauto_logged = 0;
+        u64 gtauto_game_aa = 0;     ///< PRT-GTAUTO F1 (Build B5): passes left to the game
+        u64 gtauto_early_skips = 0; ///< PRT-GTAUTO F2 (Build B5): early single scales skipped
         u64 hd_race_off_frame = ~u64{0}; ///< PRT-LATE: the last frame the race sign was off
         u64 hd_race_held_frame = ~u64{0};
         u64 hd_race_held = 0;            ///< frames the hold kept HD race off
@@ -905,6 +912,9 @@ private:
     void NoteLateSingle(bool restart, const char* why);
     /// PRT-LATE: a race's HUD seen, with RYGT_HD_RACE_HOLD's hold.
     bool HdRace();
+    /// PRT-GTAUTO5 (Build B5): GT Auto's screen in the last frames (a late scene composite, or
+    /// the race sign while the display is read back). Needs GPU.hd_ui.
+    bool GtAutoScreen() const;
     void PrepareUiTarget(Targets& targets, const GraphicsPipeline& pipeline,
                          const AmdGpu::Regs& regs);
     void FinishUiTargets(const Targets& targets);
