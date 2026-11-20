@@ -561,6 +561,14 @@ void Ryty::RytyLibraryInitialize() {
 
     Core::Loader::SymbolsResolver resolver;
     Libraries::GnmDriver::RegisterLib(&resolver);
+    // PRT-PREWARM-ONLY (Build B5, pr-tests, RYGT_PREWARM_ONLY=1): the renderer is now set up as in
+    // game (instance, device, pipeline cache); the launcher's shader step builds what was recorded
+    // and the process ends here, before the game's code runs.
+    if (Common::PrewarmOnly()) {
+        const int code = Vulkan::RunPrewarmOnly();
+        std::fflush(stdout);
+        TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
+    }
     Libraries::VideoOut::RegisterLib(&resolver);
     // ryGT: shadGT's on-screen keyboard (inline keyboard and keyboard dialog).
     Libraries::Ime::RegisterLib(&resolver);

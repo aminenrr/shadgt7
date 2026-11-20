@@ -34,6 +34,10 @@ inline std::atomic<u32> translate_done{0};
 inline std::atomic<bool> prewarm_running{false};
 inline std::atomic<u32> prewarm_total{0};
 inline std::atomic<u32> prewarm_done{0};
+// PRT-PREWARM-ONLY (Build B5): the compute recipes (PERF-GT7-037) built at start.
+inline std::atomic<bool> compute_running{false};
+inline std::atomic<u32> compute_total{0};
+inline std::atomic<u32> compute_done{0};
 } // namespace BootProgress
 
 /// The pipeline build workers' jobs (PERF-019). Urgent jobs (a draw waits) run first, the last

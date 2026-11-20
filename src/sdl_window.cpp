@@ -11,6 +11,7 @@
 #include <stb_image.h>
 
 #include "common/assert.h"
+#include "common/diagnostics.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/logging/formatter.h"
@@ -131,8 +132,13 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     // Creating the window directly in fullscreen avoids a visible windowed -> fullscreen
     // transition on startup. SDL sizes the window to the display and keeps the requested
     // width/height as the windowed size to restore when leaving fullscreen.
+    // PRT-PREWARM-ONLY (Build B5, RYGT_PREWARM_ONLY=1): the launcher's shader step shows no window.
+    const bool prewarm_only = Common::PrewarmOnly();
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN,
-                           EmulatorSettings.IsFullScreen());
+                           EmulatorSettings.IsFullScreen() && !prewarm_only);
+    if (prewarm_only) {
+        SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_HIDDEN_BOOLEAN, true);
+    }
     window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     if (window == nullptr) {
@@ -172,7 +178,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
         SDL_SetWindowFullscreenMode(
             window, EmulatorSettings.GetFullScreenMode() == "Fullscreen" ? exclusive : NULL);
     }
-    SDL_SetWindowFullscreen(window, EmulatorSettings.IsFullScreen());
+    SDL_SetWindowFullscreen(window, EmulatorSettings.IsFullScreen() && !prewarm_only);
     SDL_SyncWindow(window);
     // The window geometry is only final once the fullscreen transition has settled; refresh
     // the cached size so the first swapchain and the splashscreen use the real drawable size.

@@ -91,6 +91,13 @@ bool CompilationInProgress();
 /// FIX-GT7-023: saves the driver pipeline cache before the window's close ends the process.
 /// The MB written, or -1 if there was nothing new to save (or no cache file).
 int SaveDriverCacheAtExit();
+/// PRT-PREWARM-ONLY (Build B5, pr-tests, RYGT_PREWARM_ONLY=1): called once the renderer is set up
+/// as in game and before the game's code runs. Waits for the manifest pre-translation, the
+/// pipeline prewarm and the compute recipes (all on every core), prints PRT-PREWARM-PROGRESS
+/// lines (stdout and <RyGT7 folder>\prewarm.progress), stops early when prewarm.cancel appears
+/// there and saves the driver's pipeline cache. Returns the exit code (0, 2 when cancelled); the
+/// caller ends the process without DLL teardown.
+int RunPrewarmOnly();
 
 /// NAT-031: the pipeline cache's lookup lock. The command and recorder threads take it
 /// exclusively (as before); game job threads looking pipelines up take it shared, and step aside
@@ -214,6 +221,8 @@ public:
 
     /// FIX-GT7-023: see SaveDriverCacheAtExit.
     int SaveDriverCacheNow();
+    /// PRT-PREWARM-ONLY (Build B5): stops the start-up background builds (cancel).
+    void StopStartupBuilds();
 
 private:
     bool RefreshGraphicsKey();

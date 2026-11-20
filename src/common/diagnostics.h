@@ -38,4 +38,16 @@ inline bool VerboseLogs() {
     return on;
 }
 
+/// PRT-PREWARM-ONLY (Build B5, pr-tests): RYGT_PREWARM_ONLY=1, set by the launcher's "Precompile
+/// graphics shaders" step. The renderer starts as in game (same Vulkan instance and device, so
+/// the driver's cache keys match), builds the recorded pipelines and compute recipes on every
+/// core, saves the pipeline cache and ends the process before the game's code runs.
+inline bool PrewarmOnly() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_PREWARM_ONLY");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
 } // namespace Common

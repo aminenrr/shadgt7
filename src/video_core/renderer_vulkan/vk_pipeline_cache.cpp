@@ -1777,7 +1777,9 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
             BootProgress::translate_running.store(false, std::memory_order_release);
         }
     } translate_done_guard;
-    SleepUnlessStopped(stop, std::chrono::seconds{2});
+    if (!Common::PrewarmOnly()) { // PRT-PREWARM-ONLY: no game to give the first seconds to
+        SleepUnlessStopped(stop, std::chrono::seconds{2});
+    }
     if (stop.stop_requested() || !use_stored_shaders || !Storage::DataBase::Instance().IsOpened()) {
         LOG_WARNING(Render_Vulkan, "PERF-GT7-117: no shader store, nothing pre-translated");
         return;
@@ -1803,7 +1805,8 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
     std::atomic<u32> at_old_index{0};
     std::unordered_map<u64, Stored> programs;
     const auto work = [&] {
-        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+        Common::SetCurrentThreadPriority(Common::PrewarmOnly() ? Common::ThreadPriority::Normal
+                                                               : Common::ThreadPriority::Low);
         Shader::Pools pools;
         for (size_t i = next++; i < files.size() && !stop.stop_requested(); i = next++) {
             BootProgress::translate_done.fetch_add(1, std::memory_order_relaxed); // PRT-SPLASH
@@ -1934,7 +1937,10 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
             ++stored;
         }
     };
-    const u32 count = std::clamp<u32>(std::thread::hardware_concurrency() / 4, 1, 4);
+    // PRT-PREWARM-ONLY (Build B5): every core when no game runs.
+    const u32 count = Common::PrewarmOnly()
+                          ? std::max(1u, std::thread::hardware_concurrency())
+                          : std::clamp<u32>(std::thread::hardware_concurrency() / 4, 1, 4);
     std::vector<std::thread> threads;
     for (u32 t = 0; t < count; ++t) {
         threads.emplace_back(work);
@@ -1959,7 +1965,7 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
 static bool PrewarmOn() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_PIPELINE_PREWARM");
-        return !(env && env[0] == '0');
+        return Common::PrewarmOnly() || !(env && env[0] == '0'); // PRT-PREWARM-ONLY: always
     }();
     return on;
 }
@@ -1996,8 +2002,19 @@ std::filesystem::path PipelineCache::WarmComputeDir() const {
 
 void PipelineCache::WarmComputePipelines(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:WarmCompute");
-    Common::PreferCompileCores();
-    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    // PRT-PREWARM-ONLY (Build B5): counted for the launcher's progress; every core, normal
+    // priority, when no game runs.
+    struct ComputeDone {
+        ~ComputeDone() {
+            BootProgress::compute_running.store(false, std::memory_order_release);
+        }
+    } compute_done_guard;
+    const bool prewarm_only = Common::PrewarmOnly();
+    if (!prewarm_only) {
+        Common::PreferCompileCores();
+    }
+    Common::SetCurrentThreadPriority(prewarm_only ? Common::ThreadPriority::Normal
+                                                  : Common::ThreadPriority::Low);
     std::error_code ec;
     // The largest SPIR-V first: the ones that take the driver longest (GT7's two of ~1 s are
     // ~95 KB recipes, most others under half that). A race uses ~100 compute pipelines.
@@ -2013,6 +2030,8 @@ void PipelineCache::WarmComputePipelines(std::stop_token stop) {
     for (auto& [size, path] : sized) {
         files.push_back(std::move(path));
     }
+    BootProgress::compute_done.store(0, std::memory_order_relaxed);
+    BootProgress::compute_total.store(static_cast<u32>(files.size()), std::memory_order_relaxed);
     if (files.empty()) {
         return;
     }
@@ -2024,7 +2043,11 @@ void PipelineCache::WarmComputePipelines(std::stop_token stop) {
             return;
         }
         const auto start = std::chrono::steady_clock::now();
+        BootProgress::compute_done.fetch_add(1, std::memory_order_relaxed);
         if (ComputePipeline::WarmFromRecipe(instance, *pipeline_cache, file)) {
+            if (prewarm_only) {
+                ++num_new_pipelines; // PRT-PREWARM-ONLY: saved at the end
+            }
             const double ms = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - start)
                                   .count();
@@ -2537,6 +2560,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         pretranslate_wanted = !(pretranslate && pretranslate[0] == '0');
     }
     if (WarmComputeOn()) { // PERF-GT7-037
+        BootProgress::compute_running.store(true, std::memory_order_release); // PRT-PREWARM-ONLY
         warm_compute_thread =
             std::jthread([this](std::stop_token stop) { WarmComputePipelines(stop); });
     }
@@ -2975,6 +2999,86 @@ int SaveDriverCacheAtExit() {
     std::scoped_lock lk{g_exit_save_mutex};
     PipelineCache* const cache = g_exit_save_cache.load();
     return cache ? cache->SaveDriverCacheNow() : -1;
+}
+
+void PipelineCache::StopStartupBuilds() {
+    for (std::jthread* thread : {&pretranslate_thread, &prewarm_thread, &warm_compute_thread}) {
+        thread->request_stop(); // jthread's stop source: safe from another thread
+    }
+}
+
+// PRT-PREWARM-ONLY (Build B5, pr-tests): the launcher's "Precompile graphics shaders" step.
+int RunPrewarmOnly() {
+    using namespace std::chrono_literals;
+    const auto root = Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path();
+    const auto progress_file = root / "prewarm.progress";
+    const auto cancel_file = root / "prewarm.cancel";
+    std::error_code ec;
+    std::filesystem::remove(cancel_file, ec);
+    const auto start = std::chrono::steady_clock::now();
+    const auto seconds = [&] {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    };
+    // One line to stdout and the progress file (rewritten whole, the launcher reads its last line).
+    std::string last_line;
+    const auto report = [&](const std::string& line) {
+        if (line == last_line) {
+            return;
+        }
+        last_line = line;
+        std::fprintf(stdout, "%s\n", line.c_str());
+        std::fflush(stdout);
+        if (std::FILE* f = std::fopen(progress_file.string().c_str(), "w")) {
+            std::fprintf(f, "%s\n", line.c_str());
+            std::fclose(f);
+        }
+    };
+    LOG_WARNING(Render_Vulkan, "PRT-PREWARM-ONLY: renderer set up as in game; building the "
+                               "recorded pipelines and compute recipes on every core");
+    bool cancelled = false;
+    for (;;) {
+        const bool translating = BootProgress::translate_running.load(std::memory_order_acquire);
+        const bool prewarming = BootProgress::prewarm_running.load(std::memory_order_acquire);
+        const bool computing = BootProgress::compute_running.load(std::memory_order_acquire);
+        // Phases: translate (manifest pre-translation, before the pipelines), pipelines, compute.
+        const u32 pipe_done = BootProgress::prewarm_done.load(std::memory_order_relaxed);
+        const u32 pipe_total = BootProgress::prewarm_total.load(std::memory_order_relaxed);
+        report(fmt::format(
+            "PRT-PREWARM-PROGRESS {}/{} phase {} translate {}/{} compute {}/{}",
+            std::min(pipe_done, pipe_total), pipe_total,
+            translating ? "translate" : prewarming ? "pipelines" : computing ? "compute" : "save",
+            BootProgress::translate_done.load(std::memory_order_relaxed),
+            BootProgress::translate_total.load(std::memory_order_relaxed),
+            BootProgress::compute_done.load(std::memory_order_relaxed),
+            BootProgress::compute_total.load(std::memory_order_relaxed)));
+        if (!translating && !prewarming && !computing) {
+            break;
+        }
+        if (!cancelled && std::filesystem::exists(cancel_file, ec)) {
+            cancelled = true;
+            LOG_WARNING(Render_Vulkan, "PRT-PREWARM-ONLY: cancelled after {:.1f} s", seconds());
+            std::scoped_lock lk{g_exit_save_mutex};
+            if (PipelineCache* const cache = g_exit_save_cache.load()) {
+                cache->StopStartupBuilds();
+            }
+        }
+        std::this_thread::sleep_for(200ms);
+    }
+    std::filesystem::remove(cancel_file, ec);
+    const auto save_start = std::chrono::steady_clock::now();
+    const int saved_mb = SaveDriverCacheAtExit();
+    const std::string done = fmt::format(
+        "PRT-PREWARM-DONE {} pipelines {}/{} compute {}/{} in {:.1f} s, driver cache {} ({:.1f} s)",
+        cancelled ? "cancelled" : "ok", BootProgress::prewarm_done.load(),
+        BootProgress::prewarm_total.load(), BootProgress::compute_done.load(),
+        BootProgress::compute_total.load(), seconds(),
+        saved_mb >= 0 ? fmt::format("{} MB saved", saved_mb) : std::string{"unchanged"},
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - save_start).count());
+    LOG_WARNING(Render_Vulkan, "{}", done);
+    report(done);
+    Common::Log::Flush();
+    std::fflush(stderr);
+    return cancelled ? 2 : 0;
 }
 
 void PipelineCache::MaybeSaveDriverCache() {
@@ -5639,7 +5743,10 @@ void PipelineCache::PrewarmPipelines(std::stop_token stop) {
             BootProgress::prewarm_running.store(false, std::memory_order_release);
         }
     } prewarm_done_guard;
-    SleepUnlessStopped(stop, std::chrono::seconds{2});
+    const bool prewarm_only = Common::PrewarmOnly(); // PRT-PREWARM-ONLY (Build B5)
+    if (!prewarm_only) {
+        SleepUnlessStopped(stop, std::chrono::seconds{2});
+    }
     // The pre-translation stores translations the pipelines are built from: after it.
     while (!stop.stop_requested() &&
            BootProgress::translate_running.load(std::memory_order_acquire)) {
@@ -5755,7 +5862,8 @@ void PipelineCache::PrewarmPipelines(std::stop_token stop) {
     std::atomic<u32> nb_targets{0}, nb_geometry{0}, nb_no_vertex{0}, nb_stage{0};
     const auto work = [&](u32 index) {
         Common::SetCurrentThreadName(fmt::format("shadGT:Prewarm{}", index).c_str());
-        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+        Common::SetCurrentThreadPriority(prewarm_only ? Common::ThreadPriority::Normal
+                                                      : Common::ThreadPriority::Low);
         for (size_t i = next++; i < keys.size() && !stop.stop_requested(); i = next++) {
             // Paused while the game is in play (a race): the cores and the driver are its.
             while (g_game_in_play.load(std::memory_order_relaxed) && !stop.stop_requested()) {
@@ -5830,6 +5938,13 @@ void PipelineCache::PrewarmPipelines(std::stop_token stop) {
                 ++failed;
                 continue;
             }
+            if (prewarm_only) {
+                // PRT-PREWARM-ONLY: no game takes it; what counts is the driver's cache.
+                ++built;
+                ++num_new_pipelines;
+                pipeline.reset();
+                continue;
+            }
             bool kept = false;
             {
                 std::scoped_lock lk{prewarm_mutex};
@@ -5847,7 +5962,10 @@ void PipelineCache::PrewarmPipelines(std::stop_token stop) {
             }
         }
     };
-    const u32 count = std::clamp<u32>(std::thread::hardware_concurrency() / 4, 1, 4);
+    // PRT-PREWARM-ONLY (Build B5): every core at normal priority when no game runs.
+    const u32 count = prewarm_only
+                          ? std::max(1u, std::thread::hardware_concurrency())
+                          : std::clamp<u32>(std::thread::hardware_concurrency() / 4, 1, 4);
     std::vector<std::thread> threads;
     for (u32 t = 0; t < count; ++t) {
         threads.emplace_back(work, t);

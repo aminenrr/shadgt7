@@ -19,6 +19,7 @@
 #include "core/libraries/fiber/fiber.h"
 #include "core/libraries/kernel/threads/pthread.h"
 
+#include "common/diagnostics.h"
 #include "common/error.h"
 #include "common/logging/log.h"
 #include "common/thread.h"
@@ -563,6 +564,9 @@ bool ForEachProcessThread(unsigned long access,
 }
 
 void ConfineDriverCompileThreads() {
+    if (PrewarmOnly()) {
+        return; // PRT-PREWARM-ONLY (Build B5): no game to keep cores for
+    }
     const auto& classes = GetCoreClasses();
     // PRT-ECORE: hybrid CPUs too, with the efficiency cores as the compile cores.
     if ((classes.hybrid && !EcoreDriverCompileOn()) || classes.compile_ids.empty() ||
