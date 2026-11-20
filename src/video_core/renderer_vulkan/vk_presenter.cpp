@@ -1529,14 +1529,14 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         image_view = dlss_view;
         scaled = true;
     }
-    // PRT-GTAUTO5 (Build B5, pr-tests, log only; RYGT_PRT_GTAUTO5=0 off): on GT Auto, which DLSS
+    // PRT-GTAUTO5 (Build B5, pr-tests, log only; RYGT_PRT_GTAUTO5=1 on, off since B6): on GT Auto, which DLSS
     // output is shown: the HD UI picture (scaled with or without temporal inputs), the
     // presenter's own DLSS call (temporal, single, side viewport) or none; with the DLSS calls of
     // each kind in the same frames. One line every 600 GT Auto frames.
     if (display->gtauto) {
         static const bool gtauto5 = [] {
             const char* env = std::getenv("RYGT_PRT_GTAUTO5");
-            return !(env && env[0] == '0');
+            return env && env[0] == '1'; // B6: off by default
         }();
         struct GtAuto5 {
             u64 frames = 0, hd_temporal = 0, hd_single = 0, hd_plain = 0, own_temporal = 0,

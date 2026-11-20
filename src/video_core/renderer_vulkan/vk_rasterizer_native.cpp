@@ -1057,18 +1057,18 @@ static bool HdUiLateScene() {
     }();
     return on;
 }
-// PRT-LATE (pr-tests, RYGT_HD_UI_LATE_TEMPORAL=0 turns it off): after a late-scene restart the
+// PRT-LATE (pr-tests, RYGT_HD_UI_LATE_TEMPORAL=1 turns it on; off since B6): after a late-scene restart the
 // proxy scales right after the composite is drawn, in the same frame, with that frame's temporal
 // inputs. Before, it scaled at the next display draw, which in GT Auto comes in the next frame,
 // before that frame's anti-aliasing pass: no inputs, DLSS on a single jittered frame (shimmer).
 static bool HdUiLateTemporal() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_HD_UI_LATE_TEMPORAL");
-        return HdUiLateScene() && !(env && env[0] == '0');
+        return HdUiLateScene() && env && env[0] == '1'; // B6: off by default
     }();
     return on;
 }
-// PRT-GTAUTO G3 (pr-tests, RYGT_HD_UI_LATE_GIVE_UP=0 turns it off): a screen whose scene
+// PRT-GTAUTO G3 (pr-tests, RYGT_HD_UI_LATE_GIVE_UP=1 turns it on; off since B6): a screen whose scene
 // composite comes after the HD UI picture already scaled (GT Auto) gives the picture up for the
 // frame: everything is drawn natively and the presenter's temporal DLSS takes the whole display,
 // as with HD UI off (sharp 3D; that screen's interface at the game's resolution). The owner's
@@ -1076,7 +1076,7 @@ static bool HdUiLateTemporal() {
 static bool HdUiLateGiveUp() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_HD_UI_LATE_GIVE_UP");
-        return HdUiLateScene() && !(env && env[0] == '0');
+        return HdUiLateScene() && env && env[0] == '1'; // B6: off by default
     }();
     return on;
 }
@@ -1135,7 +1135,7 @@ bool NativeRenderer::GtAutoScreen() const {
     return late || (sign && read_back);
 }
 
-// PRT-LATE (pr-tests, RYGT_HD_RACE_HOLD=<frames>, 30 by default, 0 = off): the race sign HD UI
+// PRT-LATE (pr-tests, RYGT_HD_RACE_HOLD=<frames>, 0 = off by default since B6, was 30): the race sign HD UI
 // goes by (a map drawn with depth this frame) flickers in 3D menus. Once it is off, it stays off
 // this many frames before it may turn on again.
 static u64 HdRaceHold() {
@@ -1144,12 +1144,12 @@ static u64 HdRaceHold() {
         if (env && *env) {
             return u64(std::strtoull(env, nullptr, 10));
         }
-        return u64{30};
+        return u64{0}; // B6: off by default (was 30)
     }();
     return frames;
 }
 
-// PRT-GTAUTO2 (pr-tests, RYGT_HD_RACE_NO_READBACK=0 turns it off): GT Auto's 3D car is drawn
+// PRT-GTAUTO2 (pr-tests, RYGT_HD_RACE_NO_READBACK=1 turns it on; off since B6): GT Auto's 3D car is drawn
 // like a race's map (a small multisampled picture with depth, read by a display draw), so the
 // race sign above was on in GT Auto and its frames took the race path (aliased, low-res car). The
 // race HUD flag can't tell them apart with GPU.hd_ui (hud_depth_drawn needs the HUD split, off
@@ -1160,7 +1160,7 @@ static u64 HdRaceHold() {
 static bool HdRaceNoReadback() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_HD_RACE_NO_READBACK");
-        return !(env && env[0] == '0');
+        return env && env[0] == '1'; // B6: off by default
     }();
     return on;
 }
